@@ -57,3 +57,19 @@
   text-shadow: 0 0 8px rgba(250, 204, 21, 0.8), 0 0 20px rgba(250, 204, 21, 0.4);
 }
 
+@keyframes phoneRotateAnim {
+  0%, 20% {
+    transform: rotate(0deg) scale(1);
+  }
+  45%, 75% {
+    transform: rotate(-90deg) scale(1.08);
+  }
+  90%, 100% {
+    transform: rotate(0deg) scale(1);
+  }
+}
+
+.animate-phone-rotate {
+  animation: phoneRotateAnim 2.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
