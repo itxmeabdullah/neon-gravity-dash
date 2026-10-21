@@ -19,7 +19,9 @@ import {
   RefreshCw, 
   Loader2,
   Smartphone,
-  RotateCw
+  RotateCw,
+  Maximize,
+  Minimize
 } from 'lucide-react';
 
 import type { GameState, GravityDirection, Obstacle, Particle, LeaderboardEntry, Coin, FloatingText } from './types/game';
@@ -80,6 +82,7 @@ export default function App() {
   
   // Responsive Device & Orientation Gate State
   const [isPortraitBlocked, setIsPortraitBlocked] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // High-performance mutable state reference
   const gameRef = useRef({
@@ -213,6 +216,78 @@ export default function App() {
     }
   }, []);
 
+  // Track Fullscreen status
+  useEffect(() => {
+    const handleFsChange = () => {
+      const isFs = Boolean(
+        document.fullscreenElement || 
+        ('webkitFullscreenElement' in document && (document as unknown as { webkitFullscreenElement: Element }).webkitFullscreenElement)
+      );
+      setIsFullscreen(isFs);
+    };
+
+    document.addEventListener('fullscreenchange', handleFsChange);
+    document.addEventListener('webkitfullscreenchange', handleFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFsChange);
+      document.removeEventListener('webkitfullscreenchange', handleFsChange);
+    };
+  }, []);
+
+  // 2. Force Full-Screen Mode API for mobile browsers
+  const triggerFullscreen = useCallback(() => {
+    try {
+      const docEl = document.documentElement as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void>;
+        mozRequestFullScreen?: () => Promise<void>;
+        msRequestFullscreen?: () => Promise<void>;
+      };
+      const isAlreadyFs = Boolean(
+        document.fullscreenElement || 
+        ('webkitFullscreenElement' in document && (document as unknown as { webkitFullscreenElement: Element }).webkitFullscreenElement)
+      );
+
+      if (!isAlreadyFs) {
+        if (docEl.requestFullscreen) {
+          docEl.requestFullscreen().catch(() => {});
+        } else if (docEl.webkitRequestFullscreen) {
+          docEl.webkitRequestFullscreen().catch(() => {});
+        } else if (docEl.mozRequestFullScreen) {
+          docEl.mozRequestFullScreen().catch(() => {});
+        } else if (docEl.msRequestFullscreen) {
+          docEl.msRequestFullscreen().catch(() => {});
+        }
+      }
+    } catch {
+      // browser permissions
+    }
+  }, []);
+
+  const toggleFullscreen = useCallback((e?: React.MouseEvent | React.PointerEvent) => {
+    if (e) e.stopPropagation();
+    soundFx.playClick();
+    try {
+      const isFs = Boolean(
+        document.fullscreenElement || 
+        ('webkitFullscreenElement' in document && (document as unknown as { webkitFullscreenElement: Element }).webkitFullscreenElement)
+      );
+      if (!isFs) {
+        triggerFullscreen();
+      } else {
+        const doc = document as Document & {
+          webkitExitFullscreen?: () => Promise<void>;
+        };
+        if (doc.exitFullscreen) {
+          doc.exitFullscreen().catch(() => {});
+        } else if (doc.webkitExitFullscreen) {
+          doc.webkitExitFullscreen().catch(() => {});
+        }
+      }
+    } catch {
+      // safe
+    }
+  }, [triggerFullscreen]);
+
   // Fetch Leaderboard handler (called on Game Over screen and on demand)
   const loadLeaderboard = useCallback(async () => {
     setLoadingLeaderboard(true);
@@ -301,10 +376,18 @@ export default function App() {
     }
   }, []);
 
+  // Ref for debouncing rapid duplicate browser events (pointerdown + touchstart)
+  const lastFlipTimeRef = useRef(0);
+
   // Snappy Gravity Flip Action Handler
   const flipGravity = useCallback(() => {
     const g = gameRef.current;
     if (g.state !== 'PLAYING') return;
+
+    // Throttle against duplicate browser event dispatches (e.g., simultaneous pointerdown + touchstart or bubbled events)
+    const now = performance.now();
+    if (now - lastFlipTimeRef.current < 65) return;
+    lastFlipTimeRef.current = now;
 
     // Flip direction
     const newDir: GravityDirection = g.gravityDir === 'DOWN' ? 'UP' : 'DOWN';
@@ -402,6 +485,7 @@ export default function App() {
   // Start / Restart Game
   const startGame = useCallback(() => {
     soundFx.playClick();
+    triggerFullscreen();
     if (musicEnabled) {
       soundFx.startMusic();
     }
@@ -449,7 +533,7 @@ export default function App() {
     setIsNewHighScore(false);
     setScoreSubmitted(false);
     setMilestoneMessage(null);
-  }, [musicEnabled]);
+  }, [musicEnabled, triggerFullscreen]);
 
   // Handle Game Over
   const triggerGameOver = useCallback((calculatedFinalScore: number, calculatedFinalDist: number) => {
@@ -533,36 +617,53 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [flipGravity, startGame, togglePause]);
 
-  // 3. ZERO-LATENCY TOUCH/POINTER EVENT LISTENERS DIRECTLY ON CANVAS
+  // 1. ABSOLUTE TOUCH & CLICK EVENT FIX FOR GRAVITY FLIP
+  // Global window/document-level pointerdown and touchstart listener: window.addEventListener('pointerdown', (e) => { if(gameStarted && !isGameOver) { flipGravity(); e.preventDefault(); } });
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const handleGlobalPointerOrTouch = (e: PointerEvent | TouchEvent) => {
+      const target = e.target as HTMLElement | null;
+      // Do not block interactive UI buttons, inputs, form submissions, or links
+      if (target && (target.closest('button') || target.closest('input') || target.closest('form') || target.closest('a') || target.closest('[data-no-flip]'))) {
+        return;
+      }
 
-    // Non-passive direct touch/pointer handler
-    const handleTouchOrPointer = (e: TouchEvent | PointerEvent) => {
-      // Prevent browser tap delay or gesture interception
-      if (e.cancelable) e.preventDefault();
+      const gameStarted = gameRef.current.state === 'PLAYING';
+      const isGameOver = gameRef.current.state === 'GAMEOVER';
 
       if (musicEnabled) {
         soundFx.startMusic();
       }
 
-      if (gameRef.current.state === 'PLAYING') {
+      if (gameStarted && !isGameOver) {
         flipGravity();
-      } else if (gameRef.current.state === 'MENU' || gameRef.current.state === 'GAMEOVER') {
+        if (e.cancelable) e.preventDefault();
+      } else if (gameRef.current.state === 'MENU') {
+        triggerFullscreen();
         startGame();
+        if (e.cancelable) e.preventDefault();
       }
     };
 
-    // Attach directly to canvas with non-passive touchstart for instant response
-    canvas.addEventListener('touchstart', handleTouchOrPointer, { passive: false });
-    canvas.addEventListener('pointerdown', handleTouchOrPointer);
+    // Attach to global window
+    window.addEventListener('pointerdown', handleGlobalPointerOrTouch, { passive: false });
+    window.addEventListener('touchstart', handleGlobalPointerOrTouch, { passive: false });
+
+    // Also attach to canvas for immediate local hit-testing
+    const canvas = canvasRef.current;
+    if (canvas) {
+      canvas.addEventListener('pointerdown', handleGlobalPointerOrTouch, { passive: false });
+      canvas.addEventListener('touchstart', handleGlobalPointerOrTouch, { passive: false });
+    }
 
     return () => {
-      canvas.removeEventListener('touchstart', handleTouchOrPointer);
-      canvas.removeEventListener('pointerdown', handleTouchOrPointer);
+      window.removeEventListener('pointerdown', handleGlobalPointerOrTouch);
+      window.removeEventListener('touchstart', handleGlobalPointerOrTouch);
+      if (canvas) {
+        canvas.removeEventListener('pointerdown', handleGlobalPointerOrTouch);
+        canvas.removeEventListener('touchstart', handleGlobalPointerOrTouch);
+      }
     };
-  }, [flipGravity, startGame, musicEnabled]);
+  }, [flipGravity, startGame, musicEnabled, triggerFullscreen]);
 
   // 2. MAIN 60FPS ENGINE LOOP (NO EXPENSIVE SHADOW BLURS, DIRECT DOM HUD REFS)
   useEffect(() => {
@@ -1272,432 +1373,429 @@ export default function App() {
   };
 
   return (
-    <div className="relative flex flex-col items-center justify-between min-h-screen bg-[#080214] text-slate-100 selection:bg-pink-500 selection:text-white">
-      {/* Optional CRT scanline overlay (off by default for mobile performance) */}
-      {scanlines && <div className="absolute inset-0 crt-scanlines z-30 pointer-events-none opacity-80" />}
+    <div className="fixed inset-0 w-screen h-screen overflow-hidden bg-black text-slate-100 select-none touch-none">
+      {/* Optional CRT scanline overlay (off by default for top mobile performance) */}
+      {scanlines && <div className="absolute inset-0 crt-scanlines z-20 pointer-events-none opacity-60" />}
 
-      {/* TOP BAR CONTRACT: Brand Title | Actions | Sound / Settings */}
-      <header className="w-full max-w-5xl flex items-center justify-between gap-3 px-3 py-2.5 border-b border-purple-950/60 z-40 bg-[#080214]/90 backdrop-blur-sm">
-        {/* Brand Zone */}
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-cyan-500 to-pink-500 p-0.5 flex items-center justify-center">
-            <div className="w-full h-full bg-[#0d0420] rounded-[6px] flex items-center justify-center">
-              <ArrowUpDown className="w-3.5 h-3.5 text-cyan-400" />
-            </div>
-          </div>
-          <div>
-            <h1 className="text-sm sm:text-base font-bold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-pink-400 to-yellow-400 whitespace-nowrap">
-              NEON GRAVITY DASH
-            </h1>
-          </div>
+      {/* 1. True Full-Screen Responsive HTML5 Canvas (100vw x 100vh with object-cover) */}
+      <canvas
+        ref={canvasRef}
+        width={V_WIDTH}
+        height={V_HEIGHT}
+        className="absolute inset-0 w-full h-full object-cover block touch-none cursor-pointer"
+      />
+
+      {/* Floating Milestone Banner */}
+      {milestoneMessage && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-30 px-4 py-1 rounded-full bg-gradient-to-r from-pink-600 via-purple-600 to-cyan-500 text-white font-arcade text-xs tracking-wider font-bold shadow-[0_0_20px_rgba(255,0,128,0.5)] animate-bounce pointer-events-none">
+          {milestoneMessage}
         </div>
+      )}
 
-        {/* High-Performance Direct DOM HUD (Zero 60FPS React re-render lag) */}
-        {gameState !== 'MENU' && (
-          <div className="flex items-center gap-3 sm:gap-5 font-mono-num text-xs sm:text-sm">
-            <div className="flex flex-col items-center">
-              <span className="text-[9px] text-slate-400 tracking-wider">SCORE</span>
-              <span ref={scoreRef} className="font-bold text-cyan-300 text-xs sm:text-sm">0</span>
-            </div>
-            <div className="flex flex-col items-center">
-              <span className="text-[9px] text-slate-400 tracking-wider">DIST</span>
-              <span ref={distanceRef} className="font-semibold text-pink-400 text-xs sm:text-sm">0m</span>
-            </div>
-            
-            {/* Coins Counter */}
-            <div className="flex flex-col items-center">
-              <span className="text-[9px] text-yellow-400/90 tracking-wider flex items-center gap-0.5">
-                <Coins className="w-2.5 h-2.5 text-yellow-400" />
-                <span>COINS</span>
-              </span>
-              <div className="flex items-center gap-1 font-bold text-yellow-300 text-xs sm:text-sm">
-                <span ref={coinsRef}>0</span>
-                <span ref={comboRef} className="text-[9px] text-pink-400 font-bold" />
-              </div>
-            </div>
+      {/* ==================== FLOATING TOP-LEFT HUD (Non-blocking for thumb controls) ==================== */}
+      {gameState !== 'MENU' && (
+        <div 
+          className="absolute top-2 left-2 sm:top-3 sm:left-3 z-30 flex items-center gap-2 sm:gap-3 px-2.5 py-1 sm:px-3 sm:py-1.5 rounded-xl bg-[#090216]/80 backdrop-blur-md border border-purple-800/50 shadow-[0_4px_20px_rgba(0,0,0,0.6)] font-mono-num pointer-events-none"
+        >
+          {/* Score */}
+          <div className="flex flex-col">
+            <span className="text-[8px] sm:text-[9px] text-cyan-400 font-arcade tracking-wider leading-none">SCORE</span>
+            <span ref={scoreRef} className="font-bold text-cyan-300 text-xs sm:text-sm leading-tight">0</span>
           </div>
-        )}
 
-        {/* Right Action Controls */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          {/* Pause Button */}
-          {gameState === 'PLAYING' && (
-            <button
-              onClick={togglePause}
-              title="Pause Game (P)"
-              className="p-1.5 rounded-lg bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 text-slate-300 hover:text-white transition-colors"
-            >
-              <Pause className="w-3.5 h-3.5" />
-            </button>
-          )}
+          <div className="w-[1px] h-5 bg-purple-800/60" />
 
-          {/* Leaderboard Button */}
-          <button
-            onClick={() => {
-              soundFx.playClick();
-              loadLeaderboard();
-              setShowLeaderboard(true);
-            }}
-            title="Global Leaderboard"
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-pink-950/40 hover:bg-pink-900/60 border border-pink-700/50 text-pink-300 text-xs font-semibold hover:text-pink-100 transition-colors cursor-pointer"
-          >
-            <Trophy className="w-3.5 h-3.5 text-pink-400" />
-            <span className="hidden sm:inline">Rankings</span>
-          </button>
+          {/* Distance */}
+          <div className="flex flex-col">
+            <span className="text-[8px] sm:text-[9px] text-pink-400 font-arcade tracking-wider leading-none">DIST</span>
+            <span ref={distanceRef} className="font-semibold text-pink-300 text-xs sm:text-sm leading-tight">0m</span>
+          </div>
 
-          {/* Sound FX Toggle */}
-          <button
-            onClick={() => {
-              setSoundEnabled(!soundEnabled);
-              soundFx.playClick();
-            }}
-            title={soundEnabled ? 'Mute Sound' : 'Unmute Sound'}
-            className="p-1.5 rounded-lg bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 text-slate-300 hover:text-white transition-colors cursor-pointer"
-          >
-            {soundEnabled ? <Volume2 className="w-3.5 h-3.5 text-cyan-400" /> : <VolumeX className="w-3.5 h-3.5 text-slate-500" />}
-          </button>
+          <div className="w-[1px] h-5 bg-purple-800/60" />
 
-          {/* Procedural Synthwave Music Toggle */}
-          <button
-            onClick={() => {
-              setMusicEnabled(!musicEnabled);
-              soundFx.playClick();
-            }}
-            title={musicEnabled ? 'Mute Synthwave BGM' : 'Unmute Synthwave BGM'}
-            className={`p-1.5 px-2 rounded-lg border transition-all cursor-pointer flex items-center gap-1 ${
-              musicEnabled 
-                ? 'bg-pink-950/60 border-pink-500 text-pink-300 shadow-[0_0_10px_rgba(255,0,128,0.3)]' 
-                : 'bg-purple-950/40 border-purple-800/40 text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            <Music className={`w-3.5 h-3.5 ${musicEnabled ? 'animate-pulse text-pink-400' : ''}`} />
-            <span className="hidden sm:inline text-[10px] font-arcade font-bold tracking-wider">
-              {musicEnabled ? 'BGM' : 'OFF'}
+          {/* Coins & Combo */}
+          <div className="flex flex-col">
+            <span className="text-[8px] sm:text-[9px] text-yellow-400 font-arcade tracking-wider leading-none flex items-center gap-0.5">
+              <Coins className="w-2.5 h-2.5 text-yellow-400" />
+              <span>COINS</span>
             </span>
-          </button>
-
-          {/* CRT Scanline Toggle */}
-          <button
-            onClick={() => setScanlines(!scanlines)}
-            title="Toggle Retro CRT Lines"
-            className={`p-1.5 rounded-lg border transition-colors cursor-pointer ${
-              scanlines ? 'bg-cyan-950/50 border-cyan-500/50 text-cyan-300' : 'bg-purple-950/40 border-purple-800/40 text-slate-500'
-            }`}
-          >
-            <Tv className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </header>
-
-      {/* MAIN GAME ARENA CONTAINER */}
-      <main className="relative flex-1 w-full max-w-5xl flex flex-col items-center justify-center p-2 sm:p-3 my-auto">
-        {/* Milestone floating banner */}
-        {milestoneMessage && (
-          <div className="absolute top-4 z-30 px-3.5 py-1 rounded-full bg-pink-600 text-white font-arcade text-xs tracking-wider font-bold shadow-lg animate-bounce">
-            {milestoneMessage}
+            <div className="flex items-center gap-1 font-bold text-yellow-300 text-xs sm:text-sm leading-tight">
+              <span ref={coinsRef}>0</span>
+              <span ref={comboRef} className="text-[9px] text-pink-400 font-bold" />
+            </div>
           </div>
+        </div>
+      )}
+
+      {/* ==================== FLOATING TOP-RIGHT COMPACT CONTROLS ==================== */}
+      <div 
+        className="absolute top-2 right-2 sm:top-3 sm:right-3 z-30 flex items-center gap-1 sm:gap-1.5"
+      >
+        {/* Pause Button (Only while playing) */}
+        {gameState === 'PLAYING' && (
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              togglePause();
+            }}
+            title="Pause Game (P)"
+            className="p-1.5 sm:p-2 rounded-lg bg-[#090216]/80 backdrop-blur-md border border-purple-800/50 hover:border-cyan-400/60 text-slate-300 hover:text-white transition-colors cursor-pointer"
+          >
+            <Pause className="w-3.5 h-3.5" />
+          </button>
         )}
 
-        {/* 1. Mobile Optimized Screen Container: Fixed Aspect Ratio & Hardware-Accelerated CSS Scaling */}
-        <div className="relative w-full aspect-[16/9] max-h-[74vh] rounded-xl overflow-hidden border border-purple-900/70 bg-black flex items-center justify-center select-none touch-none">
-          {/* Locked fixed-resolution canvas with CSS object-fit: contain */}
-          <canvas
-            ref={canvasRef}
-            width={V_WIDTH}
-            height={V_HEIGHT}
-            className="w-full h-full object-contain block touch-none cursor-pointer"
-          />
+        {/* Leaderboard Button */}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            soundFx.playClick();
+            loadLeaderboard();
+            setShowLeaderboard(true);
+          }}
+          title="Rankings"
+          className="p-1.5 sm:p-2 sm:px-2.5 rounded-lg bg-[#090216]/80 backdrop-blur-md border border-pink-700/50 hover:border-pink-500 text-pink-300 text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+        >
+          <Trophy className="w-3.5 h-3.5 text-yellow-400" />
+          <span className="hidden md:inline font-arcade text-[10px]">Rankings</span>
+        </button>
 
-          {/* ==================== TITLE / START MENU OVERLAY ==================== */}
-          {gameState === 'MENU' && (
-            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm p-4 text-center">
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border border-cyan-500/40 bg-cyan-950/40 text-cyan-300 text-[11px] font-arcade tracking-widest mb-2">
-                <Flame className="w-3 h-3 text-pink-400" />
-                <span>SYNTHWAVE ARCADE RUNNER</span>
-              </div>
+        {/* Sound FX Toggle */}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            setSoundEnabled(!soundEnabled);
+            soundFx.playClick();
+          }}
+          title={soundEnabled ? 'Mute Sound' : 'Unmute Sound'}
+          className="p-1.5 sm:p-2 rounded-lg bg-[#090216]/80 backdrop-blur-md border border-purple-800/50 text-slate-300 hover:text-white transition-colors cursor-pointer"
+        >
+          {soundEnabled ? <Volume2 className="w-3.5 h-3.5 text-cyan-400" /> : <VolumeX className="w-3.5 h-3.5 text-slate-500" />}
+        </button>
 
-              <h2 className="text-2xl sm:text-4xl md:text-5xl font-extrabold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-pink-400 to-yellow-300 mb-2">
-                NEON GRAVITY DASH
-              </h2>
+        {/* Cyberpunk BGM Toggle */}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            setMusicEnabled(!musicEnabled);
+            soundFx.playClick();
+          }}
+          title={musicEnabled ? 'Mute BGM' : 'Unmute BGM'}
+          className={`p-1.5 sm:p-2 rounded-lg border backdrop-blur-md transition-all cursor-pointer flex items-center gap-1 ${
+            musicEnabled 
+              ? 'bg-pink-950/70 border-pink-500 text-pink-300 shadow-[0_0_10px_rgba(255,0,128,0.3)]' 
+              : 'bg-[#090216]/80 border-purple-800/50 text-slate-500 hover:text-slate-300'
+          }`}
+        >
+          <Music className={`w-3.5 h-3.5 ${musicEnabled ? 'animate-pulse text-pink-400' : ''}`} />
+          <span className="hidden lg:inline text-[9px] font-arcade font-bold">
+            {musicEnabled ? 'BGM' : 'OFF'}
+          </span>
+        </button>
 
-              <p className="max-w-sm text-xs text-slate-300 leading-relaxed mb-4">
-                Tap anywhere to flip gravity instantly! Collect golden coins and dodge neon barriers on the floor and ceiling.
-              </p>
+        {/* Fullscreen Mode Toggle Button */}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={toggleFullscreen}
+          title={isFullscreen ? 'Exit Fullscreen' : 'Enter Fullscreen'}
+          className="p-1.5 sm:p-2 rounded-lg bg-[#090216]/80 backdrop-blur-md border border-purple-800/50 hover:border-cyan-400/60 text-slate-300 hover:text-cyan-300 transition-colors cursor-pointer"
+        >
+          {isFullscreen ? <Minimize className="w-3.5 h-3.5 text-cyan-400" /> : <Maximize className="w-3.5 h-3.5 text-slate-300" />}
+        </button>
+      </div>
 
-              {/* Start Button */}
-              <div className="flex flex-col sm:flex-row items-center gap-2.5">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    startGame();
-                  }}
-                  className="px-7 py-3 rounded-xl bg-gradient-to-r from-pink-600 via-purple-600 to-cyan-600 hover:from-pink-500 hover:to-cyan-500 text-white font-arcade font-bold tracking-wider text-sm shadow-md hover:scale-105 active:scale-95 transition-all flex items-center gap-2 cursor-pointer"
-                >
-                  <Play className="w-4 h-4 fill-current" />
-                  START RUN
-                </button>
+      {/* ==================== TITLE / START MENU OVERLAY ==================== */}
+      {gameState === 'MENU' && (
+        <div 
+          onPointerDown={(e) => {
+            const target = e.target as HTMLElement | null;
+            if (target && (target.closest('button') || target.closest('a'))) return;
+            e.preventDefault();
+            triggerFullscreen();
+            startGame();
+          }}
+          className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/75 backdrop-blur-sm p-4 text-center cursor-pointer select-none"
+        >
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-cyan-500/40 bg-cyan-950/50 text-cyan-300 text-[10px] sm:text-xs font-arcade tracking-widest mb-3 shadow-[0_0_15px_rgba(0,240,255,0.25)]">
+            <Flame className="w-3.5 h-3.5 text-pink-400 animate-pulse" />
+            <span>100% FULLSCREEN RETRO ENDLESS RUNNER</span>
+          </div>
 
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    soundFx.playClick();
-                    loadLeaderboard();
-                    setShowLeaderboard(true);
-                  }}
-                  className="px-4 py-2.5 rounded-xl bg-purple-950/60 hover:bg-purple-900/70 border border-purple-700/60 text-slate-200 font-arcade text-xs tracking-wide transition-colors flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Trophy className="w-3.5 h-3.5 text-yellow-400" />
-                  VIEW HIGH SCORES
-                </button>
-              </div>
+          <h2 className="text-3xl sm:text-5xl md:text-6xl font-extrabold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-pink-400 to-yellow-300 mb-2 drop-shadow-[0_0_20px_rgba(255,0,128,0.4)]">
+            NEON GRAVITY DASH
+          </h2>
 
-              {/* Controls Hint */}
-              <div className="mt-4 flex items-center gap-3 text-[10px] text-slate-400">
-                <span>📱 Tap Screen to Flip</span>
-                <span>·</span>
-                <span>⌨️ Spacebar / Arrow Up</span>
-              </div>
-            </div>
-          )}
+          <p className="max-w-md text-xs sm:text-sm text-slate-300 leading-relaxed font-arcade mb-5 px-2">
+            Tap anywhere to flip gravity instantly! Collect golden coins, dodge floor & ceiling laser spikes, and survive at hyper speed.
+          </p>
 
-          {/* ==================== PAUSED OVERLAY ==================== */}
-          {gameState === 'PAUSED' && (
-            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm p-4 text-center">
-              <h3 className="text-xl sm:text-3xl font-arcade font-bold text-yellow-400 tracking-wider mb-3">
-                SYSTEM PAUSED
-              </h3>
-              <div className="flex items-center gap-2.5">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    togglePause();
-                  }}
-                  className="px-5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-arcade text-xs font-semibold tracking-wider transition-colors cursor-pointer"
-                >
-                  RESUME
-                </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    startGame();
-                  }}
-                  className="px-5 py-2 rounded-lg bg-purple-950 hover:bg-purple-900 border border-purple-700 text-slate-200 font-arcade text-xs transition-colors cursor-pointer"
-                >
-                  RESTART
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* ==================== GAME OVER SCREEN ==================== */}
-          {gameState === 'GAMEOVER' && (
-            <div 
-              onClick={(e) => e.stopPropagation()}
-              className="absolute inset-0 z-20 flex flex-col bg-black/90 backdrop-blur-sm p-3 sm:p-4 text-center overflow-y-auto"
+          {/* Start Run button */}
+          <div className="flex flex-col sm:flex-row items-center gap-3">
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerFullscreen();
+                startGame();
+              }}
+              className="px-8 py-3.5 rounded-2xl bg-gradient-to-r from-pink-600 via-purple-600 to-cyan-500 hover:from-pink-500 hover:to-cyan-400 text-white font-arcade font-bold tracking-wider text-sm sm:text-base shadow-[0_0_25px_rgba(255,0,128,0.4)] hover:scale-105 active:scale-95 transition-all flex items-center gap-2.5 cursor-pointer"
             >
-              {/* Header strip */}
-              <div className="flex items-center justify-between w-full max-w-3xl mx-auto pb-1.5 mb-2 border-b border-purple-900/60">
-                <div className="flex items-center gap-1 text-pink-500 font-arcade text-[10px] uppercase">
-                  <ShieldAlert className="w-3 h-3" />
-                  <span>NEURAL LINK SEVERED</span>
+              <Play className="w-4 h-4 fill-current text-white" />
+              <span>START RUN</span>
+            </button>
+
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                soundFx.playClick();
+                loadLeaderboard();
+                setShowLeaderboard(true);
+              }}
+              className="px-5 py-3 rounded-2xl bg-purple-950/70 hover:bg-purple-900/80 border border-purple-700/60 text-slate-200 font-arcade text-xs sm:text-sm tracking-wide transition-colors flex items-center gap-2 cursor-pointer"
+            >
+              <Trophy className="w-4 h-4 text-yellow-400" />
+              <span>LEADERBOARD</span>
+            </button>
+          </div>
+
+          {highScore > 0 && (
+            <div className="mt-4 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-black/50 border border-purple-800/40 text-yellow-400 font-mono-num text-xs">
+              <Trophy className="w-3 h-3" />
+              <span>PERSONAL BEST: {highScore} PTS</span>
+            </div>
+          )}
+
+          <div className="mt-4 flex items-center gap-3 text-[10px] text-slate-400 font-arcade">
+            <span>📱 TAP ANYWHERE TO FLIP GRAVITY</span>
+            <span>·</span>
+            <span>⌨️ SPACE / UP ARROW</span>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== PAUSED OVERLAY ==================== */}
+      {gameState === 'PAUSED' && (
+        <div 
+          onPointerDown={(e) => e.stopPropagation()}
+          className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm p-4 text-center"
+        >
+          <h3 className="text-2xl sm:text-4xl font-arcade font-bold text-yellow-400 tracking-wider mb-4 drop-shadow-[0_0_15px_rgba(250,204,21,0.5)]">
+            SYSTEM PAUSED
+          </h3>
+          <div className="flex items-center gap-3">
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                togglePause();
+              }}
+              className="px-6 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-arcade text-xs sm:text-sm font-semibold tracking-wider transition-colors cursor-pointer shadow-[0_0_15px_rgba(0,240,255,0.4)]"
+            >
+              RESUME
+            </button>
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerFullscreen();
+                startGame();
+              }}
+              className="px-6 py-2.5 rounded-xl bg-purple-950 hover:bg-purple-900 border border-purple-700 text-slate-200 font-arcade text-xs sm:text-sm transition-colors cursor-pointer"
+            >
+              RESTART
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== GAME OVER SCREEN ==================== */}
+      {gameState === 'GAMEOVER' && (
+        <div 
+          onPointerDown={(e) => e.stopPropagation()}
+          className="absolute inset-0 z-20 flex flex-col bg-black/85 backdrop-blur-md p-3 sm:p-5 text-center overflow-y-auto"
+        >
+          {/* Header strip */}
+          <div className="flex items-center justify-between w-full max-w-4xl mx-auto pb-2 mb-2 border-b border-purple-900/60">
+            <div className="flex items-center gap-1 text-pink-500 font-arcade text-[10px] sm:text-xs uppercase">
+              <ShieldAlert className="w-3.5 h-3.5" />
+              <span>NEURAL LINK TERMINATED</span>
+            </div>
+            <h3 className="text-xl sm:text-3xl font-extrabold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-red-500 via-pink-500 to-yellow-400">
+              GAME OVER
+            </h3>
+            <div className="text-[10px] sm:text-xs text-cyan-400 font-arcade">
+              <span>GLOBAL HALL OF FAME</span>
+            </div>
+          </div>
+
+          {isNewHighScore && (
+            <div className="mb-2 self-center px-4 py-1 rounded-full bg-yellow-500/20 border border-yellow-400/60 text-yellow-300 font-arcade text-xs tracking-wider animate-pulse flex items-center gap-1.5">
+              <Trophy className="w-3.5 h-3.5 text-yellow-400" />
+              <span>NEW PERSONAL RECORD ACHIEVED!</span>
+            </div>
+          )}
+
+          {/* Game Over Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-3 w-full max-w-4xl mx-auto flex-1 items-stretch my-auto">
+            {/* Left Column: Player Stats & Actions */}
+            <div className="md:col-span-5 flex flex-col items-center justify-center p-3 rounded-2xl bg-purple-950/40 border border-purple-800/50 backdrop-blur-sm">
+              {/* Stats */}
+              <div className="grid grid-cols-3 gap-2 w-full mb-3 font-mono-num">
+                <div className="p-2 rounded-xl bg-black/70 border border-purple-800/50 flex flex-col items-center">
+                  <span className="text-[9px] text-cyan-400 font-arcade tracking-wider">SCORE</span>
+                  <span className="text-base sm:text-lg font-bold text-cyan-300">{finalScore}</span>
                 </div>
-                <h3 className="text-lg sm:text-2xl font-extrabold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-red-500 via-pink-500 to-yellow-400">
-                  GAME OVER
-                </h3>
-                <div className="text-[10px] text-cyan-400 font-arcade">
-                  <span>TOP 10 PILOTS</span>
+                <div className="p-2 rounded-xl bg-black/70 border border-purple-800/50 flex flex-col items-center">
+                  <span className="text-[9px] text-pink-400 font-arcade tracking-wider">DIST</span>
+                  <span className="text-base sm:text-lg font-bold text-pink-400">{finalDistance}m</span>
+                </div>
+                <div className="p-2 rounded-xl bg-black/70 border border-purple-800/50 flex flex-col items-center">
+                  <span className="text-[9px] text-yellow-400 font-arcade tracking-wider">COINS</span>
+                  <span className="text-base sm:text-lg font-bold text-yellow-300">{finalCoins}</span>
                 </div>
               </div>
 
-              {isNewHighScore && (
-                <div className="mb-2 self-center px-3 py-0.5 rounded-full bg-yellow-500/20 border border-yellow-400/50 text-yellow-300 font-arcade text-[11px] tracking-wider animate-pulse flex items-center gap-1">
-                  <Trophy className="w-3 h-3 text-yellow-400" />
-                  <span>NEW PERSONAL BEST!</span>
-                </div>
-              )}
+              {/* Play Again */}
+              <button
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  triggerFullscreen();
+                  startGame();
+                }}
+                className="w-full py-3 px-4 mb-3 rounded-xl bg-gradient-to-r from-pink-600 to-cyan-600 hover:from-pink-500 hover:to-cyan-500 text-white font-arcade font-bold tracking-wider text-xs sm:text-sm shadow-[0_0_20px_rgba(0,240,255,0.3)] flex items-center justify-center gap-2 cursor-pointer active:scale-95 transition-all"
+              >
+                <RotateCcw className="w-4 h-4" />
+                <span>PLAY AGAIN</span>
+              </button>
 
-              {/* Game Over Content Split Layout */}
-              <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5 w-full max-w-3xl mx-auto flex-1 items-stretch my-auto">
-                {/* Left Column: Player Stats & Submit */}
-                <div className="md:col-span-5 flex flex-col items-center justify-center p-2.5 rounded-xl bg-purple-950/30 border border-purple-800/40">
-                  {/* Stats Grid */}
-                  <div className="grid grid-cols-3 gap-1.5 w-full mb-2.5 font-mono-num">
-                    <div className="p-1.5 rounded-lg bg-black/60 border border-purple-800/50 flex flex-col items-center">
-                      <span className="text-[9px] text-slate-400 tracking-wider">SCORE</span>
-                      <span className="text-sm sm:text-base font-bold text-cyan-300">{finalScore}</span>
-                    </div>
-                    <div className="p-1.5 rounded-lg bg-black/60 border border-purple-800/50 flex flex-col items-center">
-                      <span className="text-[9px] text-slate-400 tracking-wider">DIST</span>
-                      <span className="text-sm sm:text-base font-bold text-pink-400">{finalDistance}m</span>
-                    </div>
-                    <div className="p-1.5 rounded-lg bg-black/60 border border-purple-800/50 flex flex-col items-center">
-                      <span className="text-[9px] text-yellow-400 tracking-wider">COINS</span>
-                      <span className="text-sm sm:text-base font-bold text-yellow-300">{finalCoins}</span>
-                    </div>
-                  </div>
-
-                  {/* Play Again button */}
-                  <button
-                    onClick={() => startGame()}
-                    className="w-full py-2.5 px-4 mb-2.5 rounded-xl bg-gradient-to-r from-pink-600 to-cyan-600 hover:from-pink-500 hover:to-cyan-500 text-white font-arcade font-bold tracking-wider text-xs shadow-md flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 transition-all"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    PLAY AGAIN
-                  </button>
-
-                  {/* Submit Call-sign Form */}
-                  {!scoreSubmitted ? (
-                    <form 
-                      onSubmit={handleScoreSubmit}
-                      className="w-full p-2 rounded-lg bg-black/50 border border-purple-800/50 flex flex-col gap-1.5"
-                    >
-                      <label className="text-[10px] text-slate-300 font-arcade text-left flex items-center justify-between">
-                        <span>SUBMIT CALLSIGN:</span>
-                        <span className="text-cyan-400 text-[9px]">GLOBAL LEADERBOARD</span>
-                      </label>
-                      <div className="flex gap-1.5">
-                        <input
-                          type="text"
-                          maxLength={12}
-                          value={playerName}
-                          onChange={(e) => setPlayerName(e.target.value.toUpperCase())}
-                          placeholder="CALLSIGN"
-                          className="flex-1 px-2 py-1 rounded bg-black/70 border border-purple-700/60 text-cyan-300 font-arcade text-xs uppercase placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
-                        />
-                        <button
-                          type="submit"
-                          disabled={isSubmitting || !playerName.trim()}
-                          className="px-2.5 py-1 rounded bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white font-arcade text-xs font-semibold cursor-pointer whitespace-nowrap"
-                        >
-                          {isSubmitting ? 'SAVING...' : 'SAVE'}
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <div className="w-full p-1.5 rounded-lg bg-emerald-950/40 border border-emerald-500/50 flex items-center justify-center gap-1 text-[11px] font-arcade text-emerald-300">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>SCORE SAVED TO ARCHIVES!</span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Right Column: Dynamic Top 10 Leaderboard on Game Over */}
-                <div className="md:col-span-7 flex flex-col p-2.5 rounded-xl bg-purple-950/20 border border-purple-800/40 max-h-56 sm:max-h-64 overflow-hidden">
-                  <div className="flex items-center justify-between pb-1.5 mb-1.5 border-b border-purple-900/60">
-                    <div className="flex items-center gap-1">
-                      <Trophy className="w-3.5 h-3.5 text-yellow-400" />
-                      <span className="font-arcade text-[11px] font-bold text-slate-100 tracking-wider">
-                        GLOBAL TOP 10 PLAYERS
-                      </span>
-                    </div>
+              {/* Submit Callsign */}
+              {!scoreSubmitted ? (
+                <form 
+                  onSubmit={handleScoreSubmit}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  className="w-full p-2.5 rounded-xl bg-black/60 border border-purple-800/60 flex flex-col gap-2"
+                >
+                  <label className="text-[10px] text-slate-300 font-arcade text-left flex items-center justify-between">
+                    <span>SAVE YOUR CALLSIGN:</span>
+                    <span className="text-cyan-400 text-[9px]">GLOBAL RANK</span>
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      maxLength={12}
+                      value={playerName}
+                      onChange={(e) => setPlayerName(e.target.value.toUpperCase())}
+                      placeholder="CALLSIGN"
+                      className="flex-1 px-3 py-1.5 rounded-lg bg-black/80 border border-purple-700/60 text-cyan-300 font-arcade text-xs uppercase placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
+                    />
                     <button
-                      onClick={() => loadLeaderboard()}
-                      disabled={loadingLeaderboard}
-                      title="Refresh Leaderboard"
-                      className="p-1 rounded text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer"
+                      type="submit"
+                      disabled={isSubmitting || !playerName.trim()}
+                      className="px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white font-arcade text-xs font-semibold cursor-pointer whitespace-nowrap shadow-[0_0_10px_rgba(0,240,255,0.3)]"
                     >
-                      <RefreshCw className={`w-3 h-3 ${loadingLeaderboard ? 'animate-spin text-cyan-400' : ''}`} />
+                      {isSubmitting ? 'SAVING...' : 'SAVE'}
                     </button>
                   </div>
-
-                  {/* Top 10 list */}
-                  <div className="flex-1 overflow-y-auto space-y-1 pr-1 font-mono-num text-[11px]">
-                    {loadingLeaderboard && gameOverLeaderboard.length === 0 ? (
-                      <div className="flex items-center justify-center py-6 text-cyan-400 gap-1.5 font-arcade text-[11px]">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>LOADING LEADERBOARD...</span>
-                      </div>
-                    ) : gameOverLeaderboard.length === 0 ? (
-                      <div className="text-center py-5 text-slate-500 font-arcade text-[11px]">
-                        NO SCORES RECORDED YET. BE THE FIRST!
-                      </div>
-                    ) : (
-                      gameOverLeaderboard.slice(0, 10).map((entry, idx) => {
-                        const isTop3 = idx < 3;
-                        const rankColors = [
-                          'text-yellow-400 bg-yellow-950/50 border-yellow-500/50',
-                          'text-slate-200 bg-slate-900/60 border-slate-500/50',
-                          'text-amber-500 bg-amber-950/50 border-amber-600/50',
-                        ];
-                        const rankBadgeClass = isTop3 ? rankColors[idx] : 'text-slate-400 bg-purple-950/30 border-purple-800/30';
-                        const isMe = entry.username.toUpperCase() === playerName.trim().toUpperCase() && scoreSubmitted;
-
-                        return (
-                          <div
-                            key={entry.id || idx}
-                            className={`flex items-center justify-between px-2 py-1 rounded border transition-colors ${
-                              isMe 
-                                ? 'bg-pink-950/50 border-pink-500 text-pink-200' 
-                                : 'bg-black/50 border-purple-900/40 text-slate-300'
-                            }`}
-                          >
-                            <div className="flex items-center gap-1.5">
-                              <span className={`w-4 h-4 rounded flex items-center justify-center font-bold text-[10px] border ${rankBadgeClass}`}>
-                                {idx + 1}
-                              </span>
-                              <span className="font-arcade font-bold tracking-wider text-slate-100 text-xs">
-                                {entry.username}
-                              </span>
-                              {isMe && (
-                                <span className="px-1 py-0.2 rounded bg-pink-500 text-black text-[9px] font-bold">
-                                  YOU
-                                </span>
-                              )}
-                            </div>
-
-                            <div className="flex items-center gap-2">
-                              <span className="text-[9px] text-slate-500 hidden sm:inline">
-                                {entry.distance}m
-                              </span>
-                              <span className="font-bold text-cyan-300">
-                                {entry.score}
-                              </span>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
+                </form>
+              ) : (
+                <div className="w-full p-2 rounded-xl bg-emerald-950/50 border border-emerald-500/60 flex items-center justify-center gap-1.5 text-xs font-arcade text-emerald-300">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>CALLSIGN SAVED TO ARCHIVES!</span>
                 </div>
+              )}
+            </div>
+
+            {/* Right Column: Global Top 10 Leaderboard */}
+            <div className="md:col-span-7 flex flex-col p-3 rounded-2xl bg-purple-950/30 border border-purple-800/50 max-h-64 sm:max-h-80 overflow-hidden">
+              <div className="flex items-center justify-between pb-2 mb-2 border-b border-purple-900/60">
+                <div className="flex items-center gap-1.5">
+                  <Trophy className="w-4 h-4 text-yellow-400" />
+                  <span className="font-arcade text-xs font-bold text-slate-100 tracking-wider">
+                    GLOBAL TOP 10 PILOTS
+                  </span>
+                </div>
+                <button
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    loadLeaderboard();
+                  }}
+                  disabled={loadingLeaderboard}
+                  title="Refresh Leaderboard"
+                  className="p-1 rounded text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingLeaderboard ? 'animate-spin text-cyan-400' : ''}`} />
+                </button>
+              </div>
+
+              {/* List */}
+              <div className="flex-1 overflow-y-auto space-y-1.5 pr-1 font-mono-num text-xs">
+                {loadingLeaderboard && gameOverLeaderboard.length === 0 ? (
+                  <div className="flex items-center justify-center py-8 text-cyan-400 gap-2 font-arcade text-xs">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>LOADING GLOBAL SCORES...</span>
+                  </div>
+                ) : gameOverLeaderboard.length === 0 ? (
+                  <div className="text-center py-6 text-slate-500 font-arcade text-xs">
+                    NO SCORES RECORDED YET. BE THE FIRST!
+                  </div>
+                ) : (
+                  gameOverLeaderboard.slice(0, 10).map((entry, idx) => {
+                    const isTop3 = idx < 3;
+                    const rankColors = [
+                      'text-yellow-400 bg-yellow-950/50 border-yellow-500/50',
+                      'text-slate-200 bg-slate-900/60 border-slate-500/50',
+                      'text-amber-500 bg-amber-950/50 border-amber-600/50',
+                    ];
+                    const rankBadgeClass = isTop3 ? rankColors[idx] : 'text-slate-400 bg-purple-950/30 border-purple-800/30';
+                    const isMe = entry.username.toUpperCase() === playerName.trim().toUpperCase() && scoreSubmitted;
+
+                    return (
+                      <div
+                        key={entry.id || idx}
+                        className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors ${
+                          isMe 
+                            ? 'bg-pink-950/50 border-pink-500 text-pink-200' 
+                            : 'bg-black/60 border-purple-900/40 text-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className={`w-5 h-5 rounded flex items-center justify-center font-bold text-[10px] border ${rankBadgeClass}`}>
+                            {idx + 1}
+                          </span>
+                          <span className="font-arcade font-bold tracking-wider text-slate-100 text-xs sm:text-sm">
+                            {entry.username}
+                          </span>
+                          {isMe && (
+                            <span className="px-1.5 py-0.2 rounded bg-pink-500 text-black text-[9px] font-bold">
+                              YOU
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          <span className="text-[10px] text-slate-500 hidden sm:inline">
+                            {entry.distance}m
+                          </span>
+                          <span className="font-bold text-cyan-300 sm:text-sm">
+                            {entry.score}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
               </div>
             </div>
-          )}
-        </div>
-
-        {/* MOBILE CONTROLS HINT BAR */}
-        <div className="w-full max-w-5xl mt-2 flex items-center justify-between gap-2 px-1">
-          <div className="flex items-center gap-2 text-[11px] text-slate-400 font-arcade">
-            <span className="inline-block w-2 h-2 rounded-full bg-cyan-400" />
-            <span>GRAVITY: {gameRef.current.gravityDir === 'UP' ? 'CEILING [INVERTED]' : 'FLOOR [STANDARD]'}</span>
           </div>
-
-          {/* Quick Tap Flip Action Button */}
-          <button
-            onPointerDown={(e) => {
-              e.preventDefault();
-              if (gameState === 'PLAYING') {
-                flipGravity();
-              } else if (gameState === 'MENU' || gameState === 'GAMEOVER') {
-                startGame();
-              }
-            }}
-            className="sm:hidden px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-pink-600 to-cyan-600 text-white font-arcade font-bold text-xs shadow flex items-center gap-1 active:scale-95 transition-transform cursor-pointer"
-          >
-            <ArrowUpDown className="w-3.5 h-3.5" />
-            <span>FLIP</span>
-          </button>
         </div>
-      </main>
-
-      {/* FOOTER */}
-      <footer className="w-full max-w-5xl flex items-center justify-between gap-4 px-3 py-2 text-[11px] text-slate-500 border-t border-purple-950/40">
-        <div>
-          <span>Neon Gravity Dash</span>
-        </div>
-        <div>
-          <span>Locked 60 FPS Mobile Engine</span>
-        </div>
-      </footer>
+      )}
 
       {/* ==================== GLOBAL LEADERBOARD MODAL ==================== */}
       {showLeaderboard && (
