@@ -1,0 +1,6 @@
+{
+  "name": "Neon Gravity Dash",
+  "description": "Retro synthwave 2D endless runner where flipping gravity defies hazards and sets high scores.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
