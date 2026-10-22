@@ -21,7 +21,12 @@ import {
   Smartphone,
   RotateCw,
   Maximize,
-  Minimize
+  Minimize,
+  ExternalLink,
+  Zap,
+  Radio,
+  Gamepad2,
+  Info
 } from 'lucide-react';
 
 import type { GameState, GravityDirection, Obstacle, Particle, LeaderboardEntry, Coin, FloatingText } from './types/game';
@@ -83,6 +88,8 @@ export default function App() {
   // Responsive Device & Orientation Gate State
   const [isPortraitBlocked, setIsPortraitBlocked] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(() => (typeof window !== 'undefined' ? window.innerWidth > 768 : false));
+  const isDesktopRef = useRef(typeof window !== 'undefined' ? window.innerWidth > 768 : false);
 
   // High-performance mutable state reference
   const gameRef = useRef({
@@ -156,6 +163,11 @@ export default function App() {
       // Screen size check: physical min dimension < 1024 (covers phones and iPads/tablets)
       const minScreenDim = Math.min(window.screen.width, window.screen.height);
       const isMobileDevice = isMobileUA || (isTouch && minScreenDim < 1024);
+
+      // Desktop layout: width > 768px and not a mobile handheld device
+      const isDesktopScreen = window.innerWidth > 768 && !isMobileDevice;
+      setIsDesktop(isDesktopScreen);
+      isDesktopRef.current = isDesktopScreen;
 
       // 4. If it is a desktop/PC, bypass this check entirely and load the game immediately
       if (!isMobileDevice) {
@@ -234,8 +246,12 @@ export default function App() {
     };
   }, []);
 
-  // 2. Force Full-Screen Mode API for mobile browsers
+  // 2. Force Full-Screen Mode API for mobile browsers (only on mobile screens <= 768px or handhelds)
   const triggerFullscreen = useCallback(() => {
+    // Keep desktop/laptop (width > 768px) in the clean centered non-fullscreen window with ad side panels
+    if (typeof window !== 'undefined' && window.innerWidth > 768 && !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+      return;
+    }
     try {
       const docEl = document.documentElement as HTMLElement & {
         webkitRequestFullscreen?: () => Promise<void>;
@@ -669,8 +685,11 @@ export default function App() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false }); // alpha: false for faster mobile GPU pipeline
+    // alpha: false and desynchronized: true for lowest-overhead mobile GPU pipeline
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
     if (!ctx) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'low';
 
     let animId: number;
     let hudTimer = 0;
@@ -678,23 +697,341 @@ export default function App() {
     const render = (timestamp: number) => {
       const g = gameRef.current;
       if (!g.lastTime) g.lastTime = timestamp;
-      const dt = Math.min((timestamp - g.lastTime) / 1000, 0.1);
+      const rawDt = Math.min((timestamp - g.lastTime) / 1000, 0.08);
       g.lastTime = timestamp;
 
-      // UPDATE LOGIC (only when PLAYING)
-      if (g.state === 'PLAYING') {
-        // Progress distance & speed curve
-        g.distance += (g.speed * dt) * 0.12;
-        g.speed = g.baseSpeed + Math.min(380, g.distance * 0.13);
+      const isMobile = !isDesktopRef.current;
+      const isFastMovement = g.speed > 420;
 
-        const currentScore = Math.floor(g.distance) + (g.orbsCollected * 150) + g.coinBonusScore;
-        g.score = currentScore;
+      // 2. MOBILE 60 FPS PERFORMANCE BOOSTER: DELTA-TIME CALCULATION WITH FIXED SUB-STEPPING
+      if (g.state === 'PLAYING') {
+        let remainingDt = rawDt;
+        const maxSubStep = 0.01667; // 60 FPS quantum (~16.6ms)
+
+        while (remainingDt > 0.0005) {
+          const dt = Math.min(remainingDt, maxSubStep);
+          remainingDt -= dt;
+
+          // Progress distance & speed curve
+          g.distance += (g.speed * dt) * 0.12;
+          g.speed = g.baseSpeed + Math.min(380, g.distance * 0.13);
+
+          const currentScore = Math.floor(g.distance) + (g.orbsCollected * 150) + g.coinBonusScore;
+          g.score = currentScore;
+
+          // Grid parallax shift
+          g.gridOffset = (g.gridOffset + g.speed * dt) % 35;
+
+          // Player physics with acceleration & terminal velocity
+          const accel = g.gravityDir === 'DOWN' ? g.gravity : -g.gravity;
+          g.player.vy += accel * dt;
+          g.player.vy = Math.max(-1050, Math.min(1050, g.player.vy));
+          g.player.y += g.player.vy * dt;
+
+          // Rotation & squash decay
+          const rotDiff = g.player.targetRotation - g.player.rotation;
+          g.player.rotation += rotDiff * Math.min(1, dt * 32);
+          g.player.scaleX += (1 - g.player.scaleX) * Math.min(1, dt * 16);
+          g.player.scaleY += (1 - g.player.scaleY) * Math.min(1, dt * 16);
+
+          // Ceiling collision
+          if (g.player.y <= CEILING_Y) {
+            g.player.y = CEILING_Y;
+            if (g.gravityDir === 'UP') {
+              if (Math.abs(g.player.vy) > 250) {
+                g.player.scaleX = 1.3;
+                g.player.scaleY = 0.7;
+              }
+              g.player.vy = 0;
+              g.player.isOnCeiling = true;
+            }
+          } else {
+            g.player.isOnCeiling = false;
+          }
+
+          // Floor collision
+          if (g.player.y >= FLOOR_Y - g.player.height) {
+            g.player.y = FLOOR_Y - g.player.height;
+            if (g.gravityDir === 'DOWN') {
+              if (Math.abs(g.player.vy) > 250) {
+                g.player.scaleX = 1.3;
+                g.player.scaleY = 0.7;
+              }
+              g.player.vy = 0;
+              g.player.isOnGround = true;
+            }
+          } else {
+            g.player.isOnGround = false;
+          }
+
+          // Trail particles (lean spawn rate for 60fps mobile, capped array to 28)
+          if (g.particles.length < 28 && Math.random() > 0.4) {
+            const trailColor = g.gravityDir === 'UP' ? '#ff007f' : '#00f0ff';
+            g.particles.push({
+              x: g.player.x + 2,
+              y: g.player.y + (g.gravityDir === 'UP' ? 4 : g.player.height - 4),
+              vx: -Math.random() * 90 - 40,
+              vy: (Math.random() - 0.5) * 20,
+              size: 2.2,
+              color: trailColor,
+              alpha: 0.8,
+              decay: 3.5,
+            });
+          }
+
+          // Obstacles Spawning
+          g.spawnTimer += g.speed * dt;
+          if (g.spawnTimer >= g.nextSpawnDistance) {
+            g.spawnTimer = 0;
+            g.nextSpawnDistance = Math.floor(Math.random() * 100 + 240 - Math.min(70, g.distance * 0.03));
+
+            const roll = Math.random();
+            const id = 'obs-' + Date.now();
+
+            if (roll < 0.42) {
+              // Floor Spike / Barrier
+              const isSpike = Math.random() > 0.4;
+              const h = Math.random() * 32 + 30;
+              g.obstacles.push({
+                id,
+                x: V_WIDTH + 15,
+                y: FLOOR_Y - h,
+                width: isSpike ? 28 : 22,
+                height: h,
+                attachment: 'FLOOR',
+                color: '#00f0ff',
+                type: isSpike ? 'SPIKE' : 'BARRIER',
+                passed: false,
+              });
+            } else if (roll < 0.78) {
+              // Ceiling Spike / Barrier
+              const isSpike = Math.random() > 0.4;
+              const h = Math.random() * 32 + 30;
+              g.obstacles.push({
+                id,
+                x: V_WIDTH + 15,
+                y: CEILING_Y,
+                width: isSpike ? 28 : 22,
+                height: h,
+                attachment: 'CEILING',
+                color: '#ff007f',
+                type: isSpike ? 'SPIKE' : 'BARRIER',
+                passed: false,
+              });
+            } else if (roll < 0.9) {
+              // Energy Crystal Orb
+              const orbY = CEILING_Y + 50 + Math.random() * (FLOOR_Y - CEILING_Y - 100);
+              g.obstacles.push({
+                id,
+                x: V_WIDTH + 15,
+                y: orbY,
+                width: 20,
+                height: 20,
+                attachment: 'FLOATING',
+                color: '#ffe600',
+                type: 'ORB',
+                passed: false,
+                pulsePhase: 0,
+              });
+            } else {
+              // Laser hazard
+              const isUpper = Math.random() > 0.5;
+              g.obstacles.push({
+                id,
+                x: V_WIDTH + 15,
+                y: isUpper ? CEILING_Y : FLOOR_Y - 45,
+                width: 26,
+                height: 45,
+                attachment: isUpper ? 'CEILING' : 'FLOOR',
+                color: isUpper ? '#ff007f' : '#00f0ff',
+                type: 'LASER',
+                passed: false,
+                pulsePhase: 0,
+              });
+            }
+          }
+
+          // Coins Spawning
+          g.coinSpawnTimer += g.speed * dt;
+          if (g.coinSpawnTimer >= g.nextCoinSpawnDistance) {
+            g.coinSpawnTimer = 0;
+            g.nextCoinSpawnDistance = Math.floor(Math.random() * 120 + 180);
+            spawnCoinFormation(V_WIDTH + 30);
+          }
+
+          // Coins Update & Collision
+          const pCenterX = g.player.x + PLAYER_SIZE / 2;
+          const pCenterY = g.player.y + PLAYER_SIZE / 2;
+
+          for (let i = g.coins.length - 1; i >= 0; i--) {
+            const coin = g.coins[i];
+            coin.x -= g.speed * dt;
+            coin.spin += dt * 5;
+            coin.floatPhase += dt * 3.5;
+            coin.y = coin.baseY + Math.sin(coin.floatPhase) * 5;
+
+            // Magnet pull
+            const dx = pCenterX - coin.x;
+            const dy = pCenterY - coin.y;
+            const distToPlayer = Math.hypot(dx, dy);
+
+            if (distToPlayer < 65 && !coin.collected) {
+              coin.x += dx * dt * 8;
+              coin.y += dy * dt * 8;
+            }
+
+            if (coin.x < -30) {
+              g.coins.splice(i, 1);
+              continue;
+            }
+
+            if (!coin.collected && distToPlayer < (PLAYER_SIZE / 2 + coin.radius + 5)) {
+              coin.collected = true;
+              g.coinsCollected += 1;
+
+              if (timestamp - g.lastCoinTimestamp < 2200) {
+                g.combo = Math.min(5, g.combo + 1);
+              } else {
+                g.combo = 1;
+              }
+              g.lastCoinTimestamp = timestamp;
+
+              const earnedPoints = coin.value * g.combo;
+              g.coinBonusScore += earnedPoints;
+
+              soundFx.playCoinCollect(g.combo);
+
+              g.floatingTexts.push({
+                id: 'ft-' + Date.now() + Math.random(),
+                x: coin.x,
+                y: coin.y - 8,
+                vy: -60,
+                text: g.combo > 1 ? `+${earnedPoints} x${g.combo}` : `+${earnedPoints}`,
+                color: g.combo > 1 ? '#ff007f' : '#ffe600',
+                alpha: 1,
+              });
+
+              // Lean particle burst (6 sparks)
+              for (let p = 0; p < 6; p++) {
+                const ang = (Math.PI * 2 * p) / 6;
+                const spd = Math.random() * 110 + 60;
+                g.particles.push({
+                  x: coin.x,
+                  y: coin.y,
+                  vx: Math.cos(ang) * spd,
+                  vy: Math.sin(ang) * spd,
+                  size: 2.5,
+                  color: '#ffe600',
+                  alpha: 1,
+                  decay: 4.0,
+                });
+              }
+
+              g.coins.splice(i, 1);
+            }
+          }
+
+          // Floating texts update
+          for (let i = g.floatingTexts.length - 1; i >= 0; i--) {
+            const ft = g.floatingTexts[i];
+            ft.y += ft.vy * dt;
+            ft.alpha -= dt * 1.5;
+            if (ft.alpha <= 0) {
+              g.floatingTexts.splice(i, 1);
+            }
+          }
+
+          // Shockwaves update
+          for (let i = g.shockwaves.length - 1; i >= 0; i--) {
+            const sw = g.shockwaves[i];
+            sw.r += (sw.maxR - sw.r) * dt * 14;
+            sw.alpha -= dt * 2.8;
+            if (sw.alpha <= 0) {
+              g.shockwaves.splice(i, 1);
+            }
+          }
+
+          // Obstacles collision
+          for (let i = g.obstacles.length - 1; i >= 0; i--) {
+            const obs = g.obstacles[i];
+            obs.x -= g.speed * dt;
+
+            if (obs.pulsePhase !== undefined) {
+              obs.pulsePhase += dt * 6;
+            }
+
+            if (obs.x + obs.width < -40) {
+              g.obstacles.splice(i, 1);
+              continue;
+            }
+
+            if (obs.type === 'ORB') {
+              if (!obs.collected) {
+                const odx = pCenterX - (obs.x + obs.width / 2);
+                const ody = pCenterY - (obs.y + obs.height / 2);
+                const dist = Math.hypot(odx, ody);
+
+                if (dist < PLAYER_SIZE / 2 + obs.width / 2) {
+                  obs.collected = true;
+                  g.orbsCollected += 1;
+                  soundFx.playOrbCollect();
+
+                  g.floatingTexts.push({
+                    id: 'ft-orb-' + Date.now(),
+                    x: obs.x,
+                    y: obs.y - 10,
+                    vy: -60,
+                    text: '+150',
+                    color: '#00f0ff',
+                    alpha: 1,
+                  });
+
+                  g.obstacles.splice(i, 1);
+                  continue;
+                }
+              }
+            } else {
+              // Collision detection with hazards
+              const pBox = {
+                left: g.player.x + 4,
+                right: g.player.x + PLAYER_SIZE - 4,
+                top: g.player.y + 4,
+                bottom: g.player.y + PLAYER_SIZE - 4,
+              };
+
+              const oBox = {
+                left: obs.x + 2,
+                right: obs.x + obs.width - 2,
+                top: obs.y + (obs.attachment === 'CEILING' ? 0 : 2),
+                bottom: obs.y + obs.height - (obs.attachment === 'FLOOR' ? 0 : 2),
+              };
+
+              const isColliding = 
+                pBox.right >= oBox.left &&
+                pBox.left <= oBox.right &&
+                pBox.bottom >= oBox.top &&
+                pBox.top <= oBox.bottom;
+
+              if (isColliding) {
+                triggerGameOver(g.score, Math.floor(g.distance));
+                break;
+              }
+            }
+          }
+
+          if (g.state !== 'PLAYING') break;
+        }
+
+        // Screen shake decay (per frame)
+        if (g.shakeDuration > 0) {
+          g.shakeDuration -= rawDt;
+        }
 
         // Throttled HUD DOM updates (10 updates/sec instead of 60 virtual DOM React re-renders)
-        hudTimer += dt;
+        hudTimer += rawDt;
         if (hudTimer >= 0.08) {
           hudTimer = 0;
-          if (scoreRef.current) scoreRef.current.textContent = String(currentScore);
+          if (scoreRef.current) scoreRef.current.textContent = String(g.score);
           if (distanceRef.current) distanceRef.current.textContent = `${Math.floor(g.distance)}m`;
           if (coinsRef.current) coinsRef.current.textContent = String(g.coinsCollected);
           if (comboRef.current) {
@@ -716,319 +1053,14 @@ export default function App() {
           setMilestoneMessage(`SPEED BOOST // ${currentMilestone}m REACHED`);
           setTimeout(() => setMilestoneMessage(null), 2200);
         }
-
-        // Screen shake decay
-        if (g.shakeDuration > 0) {
-          g.shakeDuration -= dt;
-        }
-
-        // Grid parallax shift
-        g.gridOffset = (g.gridOffset + g.speed * dt) % 35;
-
-        // Player physics
-        const accel = g.gravityDir === 'DOWN' ? g.gravity : -g.gravity;
-        g.player.vy += accel * dt;
-        g.player.vy = Math.max(-1050, Math.min(1050, g.player.vy));
-        g.player.y += g.player.vy * dt;
-
-        // Rotation & squash decay
-        const rotDiff = g.player.targetRotation - g.player.rotation;
-        g.player.rotation += rotDiff * Math.min(1, dt * 32);
-        g.player.scaleX += (1 - g.player.scaleX) * Math.min(1, dt * 16);
-        g.player.scaleY += (1 - g.player.scaleY) * Math.min(1, dt * 16);
-
-        // Ceiling collision
-        if (g.player.y <= CEILING_Y) {
-          g.player.y = CEILING_Y;
-          if (g.gravityDir === 'UP') {
-            if (Math.abs(g.player.vy) > 250) {
-              g.player.scaleX = 1.3;
-              g.player.scaleY = 0.7;
-            }
-            g.player.vy = 0;
-            g.player.isOnCeiling = true;
-          }
-        } else {
-          g.player.isOnCeiling = false;
-        }
-
-        // Floor collision
-        if (g.player.y >= FLOOR_Y - g.player.height) {
-          g.player.y = FLOOR_Y - g.player.height;
-          if (g.gravityDir === 'DOWN') {
-            if (Math.abs(g.player.vy) > 250) {
-              g.player.scaleX = 1.3;
-              g.player.scaleY = 0.7;
-            }
-            g.player.vy = 0;
-            g.player.isOnGround = true;
-          }
-        } else {
-          g.player.isOnGround = false;
-        }
-
-        // Trail particles (lean spawn rate for 60fps mobile)
-        if (Math.random() > 0.3) {
-          const trailColor = g.gravityDir === 'UP' ? '#ff007f' : '#00f0ff';
-          g.particles.push({
-            x: g.player.x + 2,
-            y: g.player.y + (g.gravityDir === 'UP' ? 4 : g.player.height - 4),
-            vx: -Math.random() * 90 - 40,
-            vy: (Math.random() - 0.5) * 20,
-            size: 2.2,
-            color: trailColor,
-            alpha: 0.8,
-            decay: 3.5,
-          });
-        }
-
-        // Obstacles Spawning
-        g.spawnTimer += g.speed * dt;
-        if (g.spawnTimer >= g.nextSpawnDistance) {
-          g.spawnTimer = 0;
-          g.nextSpawnDistance = Math.floor(Math.random() * 100 + 240 - Math.min(70, g.distance * 0.03));
-
-          const roll = Math.random();
-          const id = 'obs-' + Date.now();
-
-          if (roll < 0.42) {
-            // Floor Spike / Barrier
-            const isSpike = Math.random() > 0.4;
-            const h = Math.random() * 32 + 30;
-            g.obstacles.push({
-              id,
-              x: V_WIDTH + 15,
-              y: FLOOR_Y - h,
-              width: isSpike ? 28 : 22,
-              height: h,
-              attachment: 'FLOOR',
-              color: '#00f0ff',
-              type: isSpike ? 'SPIKE' : 'BARRIER',
-              passed: false,
-            });
-          } else if (roll < 0.78) {
-            // Ceiling Spike / Barrier
-            const isSpike = Math.random() > 0.4;
-            const h = Math.random() * 32 + 30;
-            g.obstacles.push({
-              id,
-              x: V_WIDTH + 15,
-              y: CEILING_Y,
-              width: isSpike ? 28 : 22,
-              height: h,
-              attachment: 'CEILING',
-              color: '#ff007f',
-              type: isSpike ? 'SPIKE' : 'BARRIER',
-              passed: false,
-            });
-          } else if (roll < 0.9) {
-            // Energy Crystal Orb
-            const orbY = CEILING_Y + 50 + Math.random() * (FLOOR_Y - CEILING_Y - 100);
-            g.obstacles.push({
-              id,
-              x: V_WIDTH + 15,
-              y: orbY,
-              width: 20,
-              height: 20,
-              attachment: 'FLOATING',
-              color: '#ffe600',
-              type: 'ORB',
-              passed: false,
-              pulsePhase: 0,
-            });
-          } else {
-            // Laser hazard
-            const isUpper = Math.random() > 0.5;
-            g.obstacles.push({
-              id,
-              x: V_WIDTH + 15,
-              y: isUpper ? CEILING_Y : FLOOR_Y - 45,
-              width: 26,
-              height: 45,
-              attachment: isUpper ? 'CEILING' : 'FLOOR',
-              color: isUpper ? '#ff007f' : '#00f0ff',
-              type: 'LASER',
-              passed: false,
-              pulsePhase: 0,
-            });
-          }
-        }
-
-        // Coins Spawning
-        g.coinSpawnTimer += g.speed * dt;
-        if (g.coinSpawnTimer >= g.nextCoinSpawnDistance) {
-          g.coinSpawnTimer = 0;
-          g.nextCoinSpawnDistance = Math.floor(Math.random() * 120 + 180);
-          spawnCoinFormation(V_WIDTH + 30);
-        }
-
-        // Coins Update & Collision
-        const pCenterX = g.player.x + PLAYER_SIZE / 2;
-        const pCenterY = g.player.y + PLAYER_SIZE / 2;
-
-        for (let i = g.coins.length - 1; i >= 0; i--) {
-          const coin = g.coins[i];
-          coin.x -= g.speed * dt;
-          coin.spin += dt * 5;
-          coin.floatPhase += dt * 3.5;
-          coin.y = coin.baseY + Math.sin(coin.floatPhase) * 5;
-
-          // Magnet pull
-          const dx = pCenterX - coin.x;
-          const dy = pCenterY - coin.y;
-          const distToPlayer = Math.hypot(dx, dy);
-
-          if (distToPlayer < 65 && !coin.collected) {
-            coin.x += dx * dt * 8;
-            coin.y += dy * dt * 8;
-          }
-
-          if (coin.x < -30) {
-            g.coins.splice(i, 1);
-            continue;
-          }
-
-          if (!coin.collected && distToPlayer < (PLAYER_SIZE / 2 + coin.radius + 5)) {
-            coin.collected = true;
-            g.coinsCollected += 1;
-
-            if (timestamp - g.lastCoinTimestamp < 2200) {
-              g.combo = Math.min(5, g.combo + 1);
-            } else {
-              g.combo = 1;
-            }
-            g.lastCoinTimestamp = timestamp;
-
-            const earnedPoints = coin.value * g.combo;
-            g.coinBonusScore += earnedPoints;
-
-            soundFx.playCoinCollect(g.combo);
-
-            g.floatingTexts.push({
-              id: 'ft-' + Date.now() + Math.random(),
-              x: coin.x,
-              y: coin.y - 8,
-              vy: -60,
-              text: g.combo > 1 ? `+${earnedPoints} x${g.combo}` : `+${earnedPoints}`,
-              color: g.combo > 1 ? '#ff007f' : '#ffe600',
-              alpha: 1,
-            });
-
-            // Lean particle burst (6 sparks)
-            for (let p = 0; p < 6; p++) {
-              const ang = (Math.PI * 2 * p) / 6;
-              const spd = Math.random() * 110 + 60;
-              g.particles.push({
-                x: coin.x,
-                y: coin.y,
-                vx: Math.cos(ang) * spd,
-                vy: Math.sin(ang) * spd,
-                size: 2.5,
-                color: '#ffe600',
-                alpha: 1,
-                decay: 4.0,
-              });
-            }
-
-            g.coins.splice(i, 1);
-          }
-        }
-
-        // Floating texts update
-        for (let i = g.floatingTexts.length - 1; i >= 0; i--) {
-          const ft = g.floatingTexts[i];
-          ft.y += ft.vy * dt;
-          ft.alpha -= dt * 1.5;
-          if (ft.alpha <= 0) {
-            g.floatingTexts.splice(i, 1);
-          }
-        }
-
-        // Shockwaves update
-        for (let i = g.shockwaves.length - 1; i >= 0; i--) {
-          const sw = g.shockwaves[i];
-          sw.r += (sw.maxR - sw.r) * dt * 14;
-          sw.alpha -= dt * 2.8;
-          if (sw.alpha <= 0) {
-            g.shockwaves.splice(i, 1);
-          }
-        }
-
-        // Obstacles collision
-        for (let i = g.obstacles.length - 1; i >= 0; i--) {
-          const obs = g.obstacles[i];
-          obs.x -= g.speed * dt;
-
-          if (obs.pulsePhase !== undefined) {
-            obs.pulsePhase += dt * 6;
-          }
-
-          if (obs.x + obs.width < -40) {
-            g.obstacles.splice(i, 1);
-            continue;
-          }
-
-          if (obs.type === 'ORB') {
-            if (!obs.collected) {
-              const odx = pCenterX - (obs.x + obs.width / 2);
-              const ody = pCenterY - (obs.y + obs.height / 2);
-              const dist = Math.hypot(odx, ody);
-
-              if (dist < PLAYER_SIZE / 2 + obs.width / 2) {
-                obs.collected = true;
-                g.orbsCollected += 1;
-                soundFx.playOrbCollect();
-
-                g.floatingTexts.push({
-                  id: 'ft-orb-' + Date.now(),
-                  x: obs.x,
-                  y: obs.y - 10,
-                  vy: -60,
-                  text: '+150',
-                  color: '#00f0ff',
-                  alpha: 1,
-                });
-
-                g.obstacles.splice(i, 1);
-                continue;
-              }
-            }
-          } else {
-            // Collision detection with hazards
-            const pBox = {
-              left: g.player.x + 4,
-              right: g.player.x + PLAYER_SIZE - 4,
-              top: g.player.y + 4,
-              bottom: g.player.y + PLAYER_SIZE - 4,
-            };
-
-            const oBox = {
-              left: obs.x + 2,
-              right: obs.x + obs.width - 2,
-              top: obs.y + (obs.attachment === 'CEILING' ? 0 : 2),
-              bottom: obs.y + obs.height - (obs.attachment === 'FLOOR' ? 0 : 2),
-            };
-
-            const isColliding = 
-              pBox.right >= oBox.left &&
-              pBox.left <= oBox.right &&
-              pBox.bottom >= oBox.top &&
-              pBox.top <= oBox.bottom;
-
-            if (isColliding) {
-              triggerGameOver(g.score, Math.floor(g.distance));
-              break;
-            }
-          }
-        }
       }
 
       // Update particles
       for (let i = g.particles.length - 1; i >= 0; i--) {
         const p = g.particles[i];
-        p.x += p.vx * dt;
-        p.y += p.vy * dt;
-        p.alpha -= p.decay * dt;
+        p.x += p.vx * rawDt;
+        p.y += p.vy * rawDt;
+        p.alpha -= p.decay * rawDt;
         if (p.alpha <= 0) {
           g.particles.splice(i, 1);
         }
@@ -1037,12 +1069,12 @@ export default function App() {
       // Update background elements
       const bgSpeed = g.state === 'PLAYING' ? g.speed : 90;
       g.stars.forEach((s) => {
-        s.x -= bgSpeed * dt * s.speed;
+        s.x -= bgSpeed * rawDt * s.speed;
         if (s.x < 0) s.x = V_WIDTH;
       });
 
       g.speedLines.forEach((l) => {
-        l.x -= bgSpeed * dt * l.speed;
+        l.x -= bgSpeed * rawDt * l.speed;
         if (l.x + l.length < 0) {
           l.x = V_WIDTH + Math.random() * 80;
           l.y = CEILING_Y + 15 + Math.random() * (FLOOR_Y - CEILING_Y - 30);
@@ -1050,7 +1082,7 @@ export default function App() {
       });
 
       g.citySilhouette.forEach((b) => {
-        b.x -= bgSpeed * dt * 0.16;
+        b.x -= bgSpeed * rawDt * 0.16;
       });
       if (g.citySilhouette[0] && g.citySilhouette[0].x + g.citySilhouette[0].width < -30) {
         const first = g.citySilhouette.shift()!;
@@ -1178,48 +1210,68 @@ export default function App() {
       }
       ctx.stroke();
 
-      // 7. Shockwaves (Solid crisp rings)
-      g.shockwaves.forEach((sw) => {
-        ctx.save();
-        ctx.globalAlpha = Math.max(0, sw.alpha);
-        ctx.strokeStyle = sw.color;
+      // 7. Shockwaves (Solid crisp rings - batched, NO per-item save/restore)
+      if (g.shockwaves.length > 0) {
         ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        ctx.arc(sw.x, sw.y, sw.r, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.restore();
-      });
+        for (let i = 0; i < g.shockwaves.length; i++) {
+          const sw = g.shockwaves[i];
+          ctx.globalAlpha = Math.max(0, sw.alpha);
+          ctx.strokeStyle = sw.color;
+          ctx.beginPath();
+          ctx.arc(sw.x, sw.y, sw.r, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1.0;
+      }
 
       // 8. Floating Collectible Coins (Zero shadowBlur, fast 2D geometry)
-      g.coins.forEach((coin) => {
-        ctx.save();
-        ctx.translate(coin.x, coin.y);
-        ctx.scale(Math.cos(coin.spin), 1);
+      for (let i = 0; i < g.coins.length; i++) {
+        const coin = g.coins[i];
+        if (isFastMovement && isMobile) {
+          // Optimized high-speed mobile draw: crisp direct circle with inner core
+          ctx.fillStyle = '#ffaa00';
+          ctx.beginPath();
+          ctx.arc(coin.x, coin.y, coin.radius, 0, Math.PI * 2);
+          ctx.fill();
 
-        // Outer rim
-        ctx.fillStyle = '#ffaa00';
-        ctx.beginPath();
-        ctx.arc(0, 0, coin.radius, 0, Math.PI * 2);
-        ctx.fill();
+          ctx.fillStyle = '#ffe600';
+          ctx.beginPath();
+          ctx.arc(coin.x, coin.y, coin.radius * 0.72, 0, Math.PI * 2);
+          ctx.fill();
 
-        // Inner face
-        ctx.fillStyle = '#ffe600';
-        ctx.beginPath();
-        ctx.arc(0, 0, coin.radius * 0.78, 0, Math.PI * 2);
-        ctx.fill();
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(coin.x - 1.5, coin.y - 1.5, 3, 3);
+        } else {
+          ctx.save();
+          ctx.translate(coin.x, coin.y);
+          ctx.scale(Math.cos(coin.spin), 1);
 
-        // Stamped center star
-        ctx.fillStyle = '#7a3e00';
-        ctx.font = 'bold 9px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('✦', 0, 1);
+          // Outer rim
+          ctx.fillStyle = '#ffaa00';
+          ctx.beginPath();
+          ctx.arc(0, 0, coin.radius, 0, Math.PI * 2);
+          ctx.fill();
 
-        ctx.restore();
-      });
+          // Inner face
+          ctx.fillStyle = '#ffe600';
+          ctx.beginPath();
+          ctx.arc(0, 0, coin.radius * 0.78, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Stamped center star
+          ctx.fillStyle = '#7a3e00';
+          ctx.font = 'bold 9px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('✦', 0, 1);
+
+          ctx.restore();
+        }
+      }
 
       // 9. Obstacles & Hazards (Crisp solid shapes)
-      g.obstacles.forEach((obs) => {
+      for (let i = 0; i < g.obstacles.length; i++) {
+        const obs = g.obstacles[i];
         if (obs.type === 'SPIKE') {
           ctx.fillStyle = obs.color;
           ctx.beginPath();
@@ -1258,47 +1310,46 @@ export default function App() {
           ctx.lineWidth = 1.5;
           ctx.strokeRect(obs.x, obs.y, obs.width, obs.height);
         } else if (obs.type === 'ORB') {
-          ctx.save();
           const cx = obs.x + obs.width / 2;
           const cy = obs.y + obs.height / 2;
-          ctx.translate(cx, cy);
-          ctx.rotate(obs.pulsePhase ? obs.pulsePhase * 0.8 : 0);
-
           const r = obs.width / 2;
           ctx.fillStyle = '#ffe600';
           ctx.beginPath();
-          ctx.moveTo(0, -r);
-          ctx.lineTo(r, 0);
-          ctx.moveTo(0, r);
-          ctx.lineTo(-r, 0);
+          ctx.moveTo(cx, cy - r);
+          ctx.lineTo(cx + r, cy);
+          ctx.moveTo(cx, cy + r);
+          ctx.lineTo(cx - r, cy);
           ctx.closePath();
           ctx.fill();
 
           ctx.fillStyle = '#ffffff';
-          ctx.fillRect(-2.5, -2.5, 5, 5);
-          ctx.restore();
+          ctx.fillRect(cx - 2.5, cy - 2.5, 5, 5);
         }
-      });
+      }
 
-      // 10. Particles (Fast direct rects)
-      g.particles.forEach((p) => {
-        ctx.save();
-        ctx.globalAlpha = Math.max(0, p.alpha);
-        ctx.fillStyle = p.color;
-        ctx.fillRect(p.x, p.y, p.size, p.size);
-        ctx.restore();
-      });
+      // 10. Particles (Batched direct rects: ZERO save/restore per particle!)
+      if (g.particles.length > 0) {
+        for (let i = 0; i < g.particles.length; i++) {
+          const p = g.particles[i];
+          ctx.globalAlpha = Math.max(0, p.alpha);
+          ctx.fillStyle = p.color;
+          ctx.fillRect(p.x, p.y, p.size, p.size);
+        }
+        ctx.globalAlpha = 1.0;
+      }
 
-      // 11. Floating Score Texts
-      g.floatingTexts.forEach((ft) => {
-        ctx.save();
-        ctx.globalAlpha = Math.max(0, ft.alpha);
+      // 11. Floating Score Texts (Batched: set font once, draw, restore globalAlpha once)
+      if (g.floatingTexts.length > 0) {
         ctx.font = 'bold 13px "Chakra Petch", sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillStyle = ft.color;
-        ctx.fillText(ft.text, ft.x, ft.y);
-        ctx.restore();
-      });
+        for (let i = 0; i < g.floatingTexts.length; i++) {
+          const ft = g.floatingTexts[i];
+          ctx.globalAlpha = Math.max(0, ft.alpha);
+          ctx.fillStyle = ft.color;
+          ctx.fillText(ft.text, ft.x, ft.y);
+        }
+        ctx.globalAlpha = 1.0;
+      }
 
       // 12. Player Runner (Crisp polygon, no shadow blur)
       if (g.state !== 'GAMEOVER') {
@@ -1372,12 +1423,161 @@ export default function App() {
     }
   };
 
-  return (
-    <div className="fixed inset-0 w-screen h-screen overflow-hidden bg-black text-slate-100 select-none touch-none">
+  // ==================== RESERVED AD SPACE: LEFT TOWER (DESKTOP ONLY) ====================
+  const renderLeftAdBanner = () => (
+    <aside 
+      data-no-flip="true"
+      className="w-48 xl:w-60 h-full max-h-[640px] flex flex-col justify-between p-3.5 rounded-2xl bg-[#0d0422]/90 border border-purple-800/60 shadow-[0_8px_30px_rgba(0,0,0,0.7)] backdrop-blur-md shrink-0 select-none overflow-hidden"
+    >
+      <div className="flex flex-col gap-3">
+        {/* Ad Header Label */}
+        <div className="flex items-center justify-between pb-2 border-b border-purple-800/60">
+          <div className="flex items-center gap-1.5 text-[9px] font-arcade text-pink-400 font-bold uppercase tracking-wider">
+            <span className="w-1.5 h-1.5 rounded-full bg-pink-500 animate-pulse" />
+            <span>SPONSORED AD</span>
+          </div>
+          <span className="text-[8px] font-mono-num text-slate-500 uppercase">160x600 TOWER</span>
+        </div>
+
+        {/* Sponsor Card 1 */}
+        <div className="p-2.5 xl:p-3 rounded-xl bg-purple-950/40 border border-purple-700/50 hover:border-pink-500/70 transition-all group flex flex-col gap-1.5">
+          <div className="flex items-center justify-between">
+            <span className="px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-300 text-[8px] font-arcade font-bold">CYBER GEAR</span>
+            <Zap className="w-3.5 h-3.5 text-pink-400 group-hover:scale-110 transition-transform" />
+          </div>
+          <h4 className="font-arcade text-[11px] xl:text-xs font-bold text-slate-100 group-hover:text-pink-300 transition-colors leading-snug">
+            NEURAL PULSE REFLEX WRISTBAND
+          </h4>
+          <p className="text-[9px] xl:text-[10px] text-slate-400 leading-tight">
+            Sub-millisecond tactile haptic feedback engineered for competitive gravity dashers.
+          </p>
+          <button 
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()} 
+            onClick={(e) => { e.stopPropagation(); soundFx.playClick(); }}
+            className="mt-1 w-full py-1.5 rounded-lg bg-pink-600/80 hover:bg-pink-500 text-white font-arcade text-[9px] font-semibold flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(255,0,128,0.3)] transition-colors cursor-pointer"
+          >
+            <span>SPONSOR LINK</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </button>
+        </div>
+
+        {/* Sponsor Card 2 */}
+        <div className="p-2.5 xl:p-3 rounded-xl bg-purple-950/40 border border-purple-700/50 hover:border-cyan-400/70 transition-all group flex flex-col gap-1.5">
+          <div className="flex items-center justify-between">
+            <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-[8px] font-arcade font-bold">STREAMING RADIO</span>
+            <Radio className="w-3.5 h-3.5 text-cyan-400 group-hover:scale-110 transition-transform" />
+          </div>
+          <h4 className="font-arcade text-[11px] xl:text-xs font-bold text-slate-100 group-hover:text-cyan-300 transition-colors leading-snug">
+            SYNTHWAVE FM 24/7
+          </h4>
+          <p className="text-[9px] xl:text-[10px] text-slate-400 leading-tight">
+            Endless high-octane dark synth, retrowave playlists & chiptunes live audio stream.
+          </p>
+          <button 
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()} 
+            onClick={(e) => { e.stopPropagation(); soundFx.playClick(); }}
+            className="mt-1 w-full py-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 text-white font-arcade text-[9px] font-semibold flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(0,240,255,0.3)] transition-colors cursor-pointer"
+          >
+            <span>TUNE IN FREE</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Ad Footer */}
+      <div className="pt-2 border-t border-purple-900/60 flex items-center justify-between text-[8px] font-mono-num text-slate-500">
+        <span>SLOT #L-8849</span>
+        <span className="hover:text-slate-400 flex items-center gap-0.5">
+          <Info className="w-2.5 h-2.5" />
+          <span>Reserved Ad Space</span>
+        </span>
+      </div>
+    </aside>
+  );
+
+  // ==================== RESERVED AD SPACE: RIGHT TOWER (DESKTOP ONLY) ====================
+  const renderRightAdBanner = () => (
+    <aside 
+      data-no-flip="true"
+      className="w-48 xl:w-60 h-full max-h-[640px] flex flex-col justify-between p-3.5 rounded-2xl bg-[#0d0422]/90 border border-purple-800/60 shadow-[0_8px_30px_rgba(0,0,0,0.7)] backdrop-blur-md shrink-0 select-none overflow-hidden"
+    >
+      <div className="flex flex-col gap-3">
+        {/* Ad Header Label */}
+        <div className="flex items-center justify-between pb-2 border-b border-purple-800/60">
+          <div className="flex items-center gap-1.5 text-[9px] font-arcade text-yellow-400 font-bold uppercase tracking-wider">
+            <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
+            <span>FEATURED SPONSOR</span>
+          </div>
+          <span className="text-[8px] font-mono-num text-slate-500 uppercase">160x600 TOWER</span>
+        </div>
+
+        {/* Sponsor Card 1 */}
+        <div className="p-2.5 xl:p-3 rounded-xl bg-purple-950/40 border border-purple-700/50 hover:border-yellow-400/70 transition-all group flex flex-col gap-1.5">
+          <div className="flex items-center justify-between">
+            <span className="px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-300 text-[8px] font-arcade font-bold">TOURNAMENT</span>
+            <Trophy className="w-3.5 h-3.5 text-yellow-400 group-hover:scale-110 transition-transform" />
+          </div>
+          <h4 className="font-arcade text-[11px] xl:text-xs font-bold text-slate-100 group-hover:text-yellow-300 transition-colors leading-snug">
+            GLOBAL SPEEDRUN CIRCUIT
+          </h4>
+          <p className="text-[9px] xl:text-[10px] text-slate-400 leading-tight">
+            Compete for the monthly pilot leaderboard prize pool. Claim your spot in the Hall of Fame!
+          </p>
+          <button 
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()} 
+            onClick={(e) => { e.stopPropagation(); soundFx.playClick(); }}
+            className="mt-1 w-full py-1.5 rounded-lg bg-yellow-600/80 hover:bg-yellow-500 text-black font-arcade text-[9px] font-bold flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(250,204,21,0.3)] transition-colors cursor-pointer"
+          >
+            <span>REGISTER PILOT</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </button>
+        </div>
+
+        {/* Sponsor Card 2 */}
+        <div className="p-2.5 xl:p-3 rounded-xl bg-purple-950/40 border border-purple-700/50 hover:border-purple-400/70 transition-all group flex flex-col gap-1.5">
+          <div className="flex items-center justify-between">
+            <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[8px] font-arcade font-bold">ARCADE HARDWARE</span>
+            <Gamepad2 className="w-3.5 h-3.5 text-purple-400 group-hover:scale-110 transition-transform" />
+          </div>
+          <h4 className="font-arcade text-[11px] xl:text-xs font-bold text-slate-100 group-hover:text-purple-300 transition-colors leading-snug">
+            QUANTUM OPTICAL KEYS
+          </h4>
+          <p className="text-[9px] xl:text-[10px] text-slate-400 leading-tight">
+            Zero-debounce light-speed optical triggers designed for instant split-second flips.
+          </p>
+          <button 
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()} 
+            onClick={(e) => { e.stopPropagation(); soundFx.playClick(); }}
+            className="mt-1 w-full py-1.5 rounded-lg bg-purple-700/80 hover:bg-purple-600 text-white font-arcade text-[9px] font-semibold flex items-center justify-center gap-1.5 shadow-[0_0_10px_rgba(168,85,247,0.3)] transition-colors cursor-pointer"
+          >
+            <span>EXPLORE DEALS</span>
+            <ExternalLink className="w-2.5 h-2.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Ad Footer */}
+      <div className="pt-2 border-t border-purple-900/60 flex items-center justify-between text-[8px] font-mono-num text-slate-500">
+        <span>SLOT #R-8850</span>
+        <span className="hover:text-slate-400 flex items-center gap-0.5">
+          <Info className="w-2.5 h-2.5" />
+          <span>Reserved Ad Space</span>
+        </span>
+      </div>
+    </aside>
+  );
+
+  // ==================== CORE GAME STAGE (CANVAS + IN-GAME OVERLAYS) ====================
+  const renderGameStage = () => (
+    <>
       {/* Optional CRT scanline overlay (off by default for top mobile performance) */}
       {scanlines && <div className="absolute inset-0 crt-scanlines z-20 pointer-events-none opacity-60" />}
 
-      {/* 1. True Full-Screen Responsive HTML5 Canvas (100vw x 100vh with object-cover) */}
+      {/* 1. High-Performance HTML5 Canvas (Locked 800x450 resolution, scaled with object-cover/contain) */}
       <canvas
         ref={canvasRef}
         width={V_WIDTH}
@@ -1522,7 +1722,7 @@ export default function App() {
         >
           <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-cyan-500/40 bg-cyan-950/50 text-cyan-300 text-[10px] sm:text-xs font-arcade tracking-widest mb-3 shadow-[0_0_15px_rgba(0,240,255,0.25)]">
             <Flame className="w-3.5 h-3.5 text-pink-400 animate-pulse" />
-            <span>100% FULLSCREEN RETRO ENDLESS RUNNER</span>
+            <span>RETRO SYNTHWAVE ENDLESS RUNNER</span>
           </div>
 
           <h2 className="text-3xl sm:text-5xl md:text-6xl font-extrabold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-pink-400 to-yellow-300 mb-2 drop-shadow-[0_0_20px_rgba(255,0,128,0.4)]">
@@ -1530,7 +1730,7 @@ export default function App() {
           </h2>
 
           <p className="max-w-md text-xs sm:text-sm text-slate-300 leading-relaxed font-arcade mb-5 px-2">
-            Tap anywhere to flip gravity instantly! Collect golden coins, dodge floor & ceiling laser spikes, and survive at hyper speed.
+            Tap anywhere or press Space to flip gravity instantly! Collect golden coins, dodge floor & ceiling laser spikes, and survive at hyper speed.
           </p>
 
           {/* Start Run button */}
@@ -1796,173 +1996,267 @@ export default function App() {
           </div>
         </div>
       )}
+    </>
+  );
 
-      {/* ==================== GLOBAL LEADERBOARD MODAL ==================== */}
-      {showLeaderboard && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4">
-          <div className="relative w-full max-w-md rounded-2xl bg-[#0f0521] border border-purple-800/60 shadow-2xl p-4 sm:p-5 flex flex-col max-h-[85vh]">
-            {/* Header */}
-            <div className="flex items-center justify-between pb-2.5 border-b border-purple-900/60 mb-3">
-              <div className="flex items-center gap-2">
-                <Trophy className="w-4 h-4 text-yellow-400" />
-                <h3 className="font-arcade text-base font-bold text-slate-100 tracking-wider">
-                  TOP 10 PILOTS
-                </h3>
-              </div>
-              <button
-                onClick={() => setShowLeaderboard(false)}
-                className="p-1 rounded text-slate-400 hover:text-white transition-colors cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Sync Badge */}
-            <div className="flex items-center justify-between text-[11px] font-arcade text-slate-400 mb-2.5 px-1">
-              <div className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                <span>GLOBAL ARCHIVES</span>
-              </div>
-              <button
-                onClick={() => loadLeaderboard()}
-                className="text-cyan-400 hover:underline flex items-center gap-1 cursor-pointer"
-              >
-                <RefreshCw className={`w-3 h-3 ${loadingLeaderboard ? 'animate-spin' : ''}`} />
-                <span>Refresh</span>
-              </button>
-            </div>
-
-            {/* Scores Table */}
-            <div className="flex-1 overflow-y-auto space-y-1.5 pr-1 font-mono-num text-xs">
-              {leaderboard.length === 0 ? (
-                <div className="text-center py-6 text-slate-500 font-arcade">NO RUNNERS RECORDED YET</div>
-              ) : (
-                leaderboard.slice(0, 10).map((entry, idx) => {
-                  const isTop3 = idx < 3;
-                  const rankColors = [
-                    'text-yellow-400 bg-yellow-950/40 border-yellow-500/40',
-                    'text-slate-200 bg-slate-900/60 border-slate-500/40',
-                    'text-amber-500 bg-amber-950/40 border-amber-600/40',
-                  ];
-                  const rankBadgeClass = isTop3 ? rankColors[idx] : 'text-slate-400 bg-purple-950/30 border-purple-800/30';
-
-                  return (
-                    <div
-                      key={entry.id || idx}
-                      className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors ${
-                        entry.isCurrentPlayer 
-                          ? 'bg-pink-950/30 border-pink-500/50 text-pink-200' 
-                          : 'bg-purple-950/20 border-purple-900/40 text-slate-300'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2.5">
-                        <span className={`w-5 h-5 rounded flex items-center justify-center font-bold text-[10px] border ${rankBadgeClass}`}>
-                          {idx + 1}
-                        </span>
-                        <div className="flex flex-col">
-                          <span className="font-arcade font-bold tracking-wider text-slate-100">
-                            {entry.username}
-                          </span>
-                          <span className="text-[9px] text-slate-500">{entry.distance}m</span>
-                        </div>
-                      </div>
-
-                      <div className="text-right">
-                        <span className="font-bold text-cyan-300">
-                          {entry.score}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-
-            {/* Close Button */}
-            <div className="pt-3 mt-2 border-t border-purple-900/60 flex justify-end">
-              <button
-                onClick={() => setShowLeaderboard(false)}
-                className="px-4 py-1.5 rounded-lg bg-purple-900/50 hover:bg-purple-800/60 text-slate-200 font-arcade text-xs tracking-wider transition-colors cursor-pointer"
-              >
-                CLOSE
-              </button>
-            </div>
+  // ==================== GLOBAL LEADERBOARD MODAL ====================
+  const renderLeaderboardModal = () => (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4">
+      <div className="relative w-full max-w-md rounded-2xl bg-[#0f0521] border border-purple-800/60 shadow-2xl p-4 sm:p-5 flex flex-col max-h-[85vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between pb-2.5 border-b border-purple-900/60 mb-3">
+          <div className="flex items-center gap-2">
+            <Trophy className="w-4 h-4 text-yellow-400" />
+            <h3 className="font-arcade text-base font-bold text-slate-100 tracking-wider">
+              TOP 10 PILOTS
+            </h3>
           </div>
+          <button
+            onClick={() => setShowLeaderboard(false)}
+            className="p-1 rounded text-slate-400 hover:text-white transition-colors cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
-      )}
 
-      {/* ==================== RESPONSIVE DEVICE & ORIENTATION SCREEN GATE ==================== */}
-      {isPortraitBlocked && (
-        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#070114] px-6 text-center select-none overflow-hidden">
-          {/* Ambient synthwave background grid & glow */}
-          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-pink-900/25 via-purple-950/40 to-[#070114] pointer-events-none" />
-          <div className="absolute inset-0 crt-scanlines opacity-40 pointer-events-none" />
+        {/* Sync Badge */}
+        <div className="flex items-center justify-between text-[11px] font-arcade text-slate-400 mb-2.5 px-1">
+          <div className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-cyan-400" />
+            <span>GLOBAL ARCHIVES</span>
+          </div>
+          <button
+            onClick={() => loadLeaderboard()}
+            className="text-cyan-400 hover:underline flex items-center gap-1 cursor-pointer"
+          >
+            <RefreshCw className={`w-3 h-3 ${loadingLeaderboard ? 'animate-spin' : ''}`} />
+            <span>Refresh</span>
+          </button>
+        </div>
 
-          <div className="relative z-10 flex flex-col items-center max-w-sm mx-auto">
-            {/* Status Badge */}
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-pink-500/50 bg-pink-950/60 text-pink-300 font-arcade text-[11px] tracking-widest mb-6 shadow-[0_0_15px_rgba(255,0,128,0.3)]">
-              <RotateCw className="w-3.5 h-3.5 animate-spin text-pink-400" />
-              <span>ORIENTATION LOCK // ROTATION REQUIRED</span>
-            </div>
+        {/* Scores Table */}
+        <div className="flex-1 overflow-y-auto space-y-1.5 pr-1 font-mono-num text-xs">
+          {leaderboard.length === 0 ? (
+            <div className="text-center py-6 text-slate-500 font-arcade">NO RUNNERS RECORDED YET</div>
+          ) : (
+            leaderboard.slice(0, 10).map((entry, idx) => {
+              const isTop3 = idx < 3;
+              const rankColors = [
+                'text-yellow-400 bg-yellow-950/40 border-yellow-500/40',
+                'text-slate-200 bg-slate-900/60 border-slate-500/40',
+                'text-amber-500 bg-amber-950/40 border-amber-600/40',
+              ];
+              const rankBadgeClass = isTop3 ? rankColors[idx] : 'text-slate-400 bg-purple-950/30 border-purple-800/30';
 
-            {/* Rotating Smartphone Visual with Glowing Screen & Arrows */}
-            <div className="relative w-36 h-36 flex items-center justify-center mb-6">
-              {/* Outer pulsing neon ring */}
-              <div className="absolute inset-2 rounded-full border border-cyan-500/30 animate-ping opacity-40 pointer-events-none" />
-              <div className="absolute inset-0 rounded-full border border-purple-500/30 pointer-events-none" />
-
-              {/* Animated Rotating Phone Device */}
-              <div className="relative animate-phone-rotate flex items-center justify-center">
-                <div className="w-16 h-28 rounded-2xl border-2 border-cyan-400 bg-[#0d0422] p-1.5 shadow-[0_0_30px_rgba(0,240,255,0.4)] flex flex-col justify-between items-center transition-all">
-                  {/* Top phone notch/speaker */}
-                  <div className="w-4 h-1 rounded-full bg-cyan-700/80" />
-                  
-                  {/* Phone screen graphic */}
-                  <div className="w-full flex-1 rounded-lg bg-purple-950/80 border border-purple-800/80 my-1 flex flex-col items-center justify-center p-1 relative overflow-hidden">
-                    <div className="absolute inset-0 bg-gradient-to-t from-pink-500/20 to-transparent" />
-                    <ArrowUpDown className="w-5 h-5 text-pink-400 animate-bounce relative z-10" />
-                    <span className="text-[7px] font-arcade font-bold text-cyan-300 tracking-tighter mt-1 relative z-10">
-                      16:9
+              return (
+                <div
+                  key={entry.id || idx}
+                  className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors ${
+                    entry.isCurrentPlayer 
+                      ? 'bg-pink-950/30 border-pink-500/50 text-pink-200' 
+                      : 'bg-purple-950/20 border-purple-900/40 text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5">
+                    <span className={`w-5 h-5 rounded flex items-center justify-center font-bold text-[10px] border ${rankBadgeClass}`}>
+                      {idx + 1}
                     </span>
+                    <div className="flex flex-col">
+                      <span className="font-arcade font-bold tracking-wider text-slate-100">
+                        {entry.username}
+                      </span>
+                      <span className="text-[9px] text-slate-500">{entry.distance}m</span>
+                    </div>
                   </div>
 
-                  {/* Bottom indicator */}
-                  <div className="w-5 h-1 rounded-full bg-cyan-500/80" />
+                  <div className="text-right">
+                    <span className="font-bold text-cyan-300">
+                      {entry.score}
+                    </span>
+                  </div>
                 </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Close Button */}
+        <div className="pt-3 mt-2 border-t border-purple-900/60 flex justify-end">
+          <button
+            onClick={() => setShowLeaderboard(false)}
+            className="px-4 py-1.5 rounded-lg bg-purple-900/50 hover:bg-purple-800/60 text-slate-200 font-arcade text-xs tracking-wider transition-colors cursor-pointer"
+          >
+            CLOSE
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ==================== RESPONSIVE DEVICE & ORIENTATION SCREEN GATE ====================
+  const renderOrientationGate = () => (
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#070114] px-6 text-center select-none overflow-hidden">
+      {/* Ambient synthwave background grid & glow */}
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-pink-900/25 via-purple-950/40 to-[#070114] pointer-events-none" />
+      <div className="absolute inset-0 crt-scanlines opacity-40 pointer-events-none" />
+
+      <div className="relative z-10 flex flex-col items-center max-w-sm mx-auto">
+        {/* Status Badge */}
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-pink-500/50 bg-pink-950/60 text-pink-300 font-arcade text-[11px] tracking-widest mb-6 shadow-[0_0_15px_rgba(255,0,128,0.3)]">
+          <RotateCw className="w-3.5 h-3.5 animate-spin text-pink-400" />
+          <span>ORIENTATION LOCK // ROTATION REQUIRED</span>
+        </div>
+
+        {/* Rotating Smartphone Visual with Glowing Screen & Arrows */}
+        <div className="relative w-36 h-36 flex items-center justify-center mb-6">
+          <div className="absolute inset-2 rounded-full border border-cyan-500/30 animate-ping opacity-40 pointer-events-none" />
+          <div className="absolute inset-0 rounded-full border border-purple-500/30 pointer-events-none" />
+
+          <div className="relative animate-phone-rotate flex items-center justify-center">
+            <div className="w-16 h-28 rounded-2xl border-2 border-cyan-400 bg-[#0d0422] p-1.5 shadow-[0_0_30px_rgba(0,240,255,0.4)] flex flex-col justify-between items-center transition-all">
+              <div className="w-4 h-1 rounded-full bg-cyan-700/80" />
+              
+              <div className="w-full flex-1 rounded-lg bg-purple-950/80 border border-purple-800/80 my-1 flex flex-col items-center justify-center p-1 relative overflow-hidden">
+                <div className="absolute inset-0 bg-gradient-to-t from-pink-500/20 to-transparent" />
+                <ArrowUpDown className="w-5 h-5 text-pink-400 animate-bounce relative z-10" />
+                <span className="text-[7px] font-arcade font-bold text-cyan-300 tracking-tighter mt-1 relative z-10">
+                  16:9
+                </span>
               </div>
 
-              {/* Decorative rotation orbit arrows */}
-              <div className="absolute -inset-1 pointer-events-none flex items-center justify-center">
-                <RotateCw className="w-28 h-28 text-pink-500/20 animate-spin" style={{ animationDuration: '8s' }} />
-              </div>
+              <div className="w-5 h-1 rounded-full bg-cyan-500/80" />
             </div>
+          </div>
 
-            {/* Clear Primary Instruction */}
-            <h2 className="text-xl sm:text-2xl font-bold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-pink-400 to-yellow-300 mb-3 leading-snug">
-              Please rotate your phone to Landscape mode to play Neon Gravity Dash.
-            </h2>
-
-            {/* Explanatory Context */}
-            <p className="text-xs text-slate-300/90 leading-relaxed font-arcade mb-6 max-w-xs">
-              Neon Gravity Dash is optimized for a 16:9 widescreen arcade field of view, locked 60 FPS performance, and two-thumb reflex controls.
-            </p>
-
-            {/* Live Indicator Pill */}
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/70 border border-purple-800/60 text-[11px] font-mono-num text-slate-400 mb-4">
-              <span className="w-2 h-2 rounded-full bg-pink-500 animate-pulse" />
-              <span>WAITING FOR LANDSCAPE ORIENTATION...</span>
-            </div>
-
-            {/* Subtle Bypass button for development / testing */}
-            <button
-              onClick={() => setIsPortraitBlocked(false)}
-              className="text-[10px] text-slate-500 hover:text-slate-300 underline font-arcade transition-colors cursor-pointer"
-            >
-              (Bypass check and preview in portrait)
-            </button>
+          <div className="absolute -inset-1 pointer-events-none flex items-center justify-center">
+            <RotateCw className="w-28 h-28 text-pink-500/20 animate-spin" style={{ animationDuration: '8s' }} />
           </div>
         </div>
-      )}
+
+        {/* Clear Primary Instruction */}
+        <h2 className="text-xl sm:text-2xl font-bold font-arcade tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-pink-400 to-yellow-300 mb-3 leading-snug">
+          Please rotate your phone to Landscape mode to play Neon Gravity Dash.
+        </h2>
+
+        {/* Explanatory Context */}
+        <p className="text-xs text-slate-300/90 leading-relaxed font-arcade mb-6 max-w-xs">
+          Neon Gravity Dash is optimized for a 16:9 widescreen arcade field of view, locked 60 FPS performance, and two-thumb reflex controls.
+        </p>
+
+        {/* Live Indicator Pill */}
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/70 border border-purple-800/60 text-[11px] font-mono-num text-slate-400 mb-4">
+          <span className="w-2 h-2 rounded-full bg-pink-500 animate-pulse" />
+          <span>WAITING FOR LANDSCAPE ORIENTATION...</span>
+        </div>
+
+        {/* Bypass button for dev/testing */}
+        <button
+          onClick={() => setIsPortraitBlocked(false)}
+          className="text-[10px] text-slate-500 hover:text-slate-300 underline font-arcade transition-colors cursor-pointer"
+        >
+          (Bypass check and preview in portrait)
+        </button>
+      </div>
     </div>
+  );
+
+  return (
+    <>
+      {isDesktop && !isFullscreen ? (
+        // 1. DESKTOP/LAPTOP AD SPACE LAYOUT (width > 768px): Fixed Desktop Wrapper with Centered Window & Side Ad Banners
+        <div className="fixed inset-0 w-screen h-screen overflow-hidden bg-[#070114] text-slate-100 flex flex-col justify-between select-none">
+          {/* Ambient synthwave background grid & glow */}
+          <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-purple-950/30 via-[#070114] to-[#04000b] pointer-events-none" />
+          <div className="absolute inset-0 bg-[linear-gradient(to_right,#1f0a3810_1px,transparent_1px),linear-gradient(to_bottom,#1f0a3810_1px,transparent_1px)] bg-[size:3rem_3rem] pointer-events-none" />
+
+          {/* Top Arcade Marquee Bar */}
+          <header className="relative z-20 w-full max-w-7xl mx-auto px-4 py-2 flex items-center justify-between border-b border-purple-900/40 shrink-0">
+            <div className="flex items-center gap-3">
+              <h1 className="font-arcade text-lg sm:text-xl font-extrabold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 via-pink-400 to-yellow-300 drop-shadow-[0_0_15px_rgba(255,0,128,0.3)]">
+                NEON GRAVITY DASH
+              </h1>
+              <span className="hidden sm:inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full border border-pink-500/40 bg-pink-950/40 text-[9px] font-arcade text-pink-300">
+                <Flame className="w-2.5 h-2.5 text-pink-400" />
+                <span>DESKTOP ARCADE 16:9</span>
+              </span>
+            </div>
+
+            <div className="hidden lg:flex items-center gap-6 text-xs font-mono-num text-slate-400">
+              {highScore > 0 && (
+                <div className="flex items-center gap-1.5 text-yellow-400 font-bold">
+                  <Trophy className="w-3.5 h-3.5" />
+                  <span>BEST: {highScore} PTS</span>
+                </div>
+              )}
+              <div className="flex items-center gap-1.5 text-cyan-400 font-arcade text-[10px]">
+                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                <span>60 FPS PERFORMANCE ENGINE</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  soundFx.playClick();
+                  loadLeaderboard();
+                  setShowLeaderboard(true);
+                }}
+                className="px-2.5 py-1.5 rounded-lg bg-[#0e0422] border border-pink-700/50 hover:border-pink-500 text-pink-300 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Trophy className="w-3.5 h-3.5 text-yellow-400" />
+                <span className="font-arcade text-[10px]">Rankings</span>
+              </button>
+              <button
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={toggleFullscreen}
+                title="Expand to Fullscreen"
+                className="p-1.5 rounded-lg bg-[#0e0422] border border-purple-800/50 hover:border-cyan-400 text-slate-300 hover:text-cyan-300 transition-colors cursor-pointer"
+              >
+                <Maximize className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </header>
+
+          {/* Centered Arcade Window Flanked by Reserved Ad Side Towers */}
+          <main className="relative z-10 flex-1 w-full max-w-[1600px] mx-auto px-4 py-2 flex items-center justify-center gap-4 xl:gap-6 min-h-0">
+            {/* Left Ad Banner Container (Specifically Reserved for Ads) */}
+            {renderLeftAdBanner()}
+
+            {/* Centered Non-Fullscreen 16:9 Arcade Game Window */}
+            <section className="relative flex items-center justify-center h-full max-h-[640px] aspect-[16/9] w-auto max-w-[960px] rounded-2xl overflow-hidden border-2 border-purple-600/70 shadow-[0_0_50px_rgba(255,0,128,0.25)] bg-black">
+              {renderGameStage()}
+            </section>
+
+            {/* Right Ad Banner Container (Specifically Reserved for Ads) */}
+            {renderRightAdBanner()}
+          </main>
+
+          {/* Desktop Footer Bar */}
+          <footer className="relative z-20 w-full max-w-7xl mx-auto px-4 py-1.5 flex items-center justify-between text-[11px] font-arcade text-slate-400 border-t border-purple-900/40 shrink-0">
+            <div className="flex items-center gap-3">
+              <span>⌨️ SPACE / UP ARROW / LEFT CLICK TO FLIP GRAVITY</span>
+              <span>·</span>
+              <span>P TO PAUSE</span>
+            </div>
+            <div className="hidden sm:flex items-center gap-2 text-[10px] text-purple-400">
+              <span>RESERVED ADVERTISING UNITS ACTIVE</span>
+              <span>·</span>
+              <span>LOCKED 60 FPS MOBILE & DESKTOP DUAL ENGINE</span>
+            </div>
+          </footer>
+        </div>
+      ) : (
+        // 2. MOBILE LAYOUT (width <= 768px or Fullscreen): Strictly Full-Screen, Edge-to-Edge, Zero Ad Containers
+        <div className="fixed inset-0 w-screen h-screen overflow-hidden bg-black text-slate-100 select-none touch-none">
+          {renderGameStage()}
+        </div>
+      )}
+
+      {/* Global Overlays: Leaderboard Modal & Mobile Portrait Orientation Gate */}
+      {showLeaderboard && renderLeaderboardModal()}
+      {isPortraitBlocked && renderOrientationGate()}
+    </>
   );
 }

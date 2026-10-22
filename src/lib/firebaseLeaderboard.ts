@@ -1,4 +1,5 @@
 import { initializeApp, getApps, type FirebaseApp } from 'firebase/app';
+import { getAuth, signInAnonymously } from 'firebase/auth';
 import { 
   getFirestore, 
   collection, 
@@ -72,6 +73,12 @@ if (getApps().length === 0) {
 
 export const db: Firestore = getFirestore(app);
 
+// Initialize Firebase Auth and execute signInAnonymously as soon as app loads
+export const auth = getAuth(app);
+signInAnonymously(auth).catch((err) => {
+  console.warn('Anonymous authentication error on app load:', err);
+});
+
 // Local Storage helpers for fallback
 function getLocalScores(): LeaderboardEntry[] {
   try {
@@ -110,20 +117,37 @@ function saveLocalScore(username: string, score: number, distance: number = 0): 
 }
 
 /**
- * 2. saveHighScore(username, score)
- * Adds a document to the "leaderboard" collection in Firestore
+ * 2. saveHighScore(username, score, distance)
+ * Adds a document to the "leaderboard" collection in Firestore only when
+ * an authenticated user session (auth.currentUser) exists.
  */
 export async function saveHighScore(
   username: string, 
   score: number, 
   distance: number = 0
-): Promise<{ success: boolean; id?: string }> {
+): Promise<{ success: boolean; id?: string; error?: string }> {
+  // Ensure score submissions only proceed when an authenticated user session (auth.currentUser) exists
+  if (!auth.currentUser) {
+    try {
+      await signInAnonymously(auth);
+    } catch (err) {
+      console.warn('Anonymous sign-in attempt failed during score submission:', err);
+    }
+  }
+
+  // Guard: Strictly block score submission to Firestore if no authenticated user session exists
+  if (!auth.currentUser) {
+    console.warn('Score submission cancelled: No authenticated user session (auth.currentUser) exists.');
+    return { success: false, error: 'User is not authenticated' };
+  }
+
   const cleanUsername = username.trim().toUpperCase() || 'PLAYER';
   const cleanScore = Math.floor(score);
   const cleanDistance = Math.floor(distance);
 
   try {
     const docRef = await addDoc(collection(db, 'leaderboard'), {
+      userId: auth.currentUser.uid,
       username: cleanUsername,
       score: cleanScore,
       distance: cleanDistance,
